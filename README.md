@@ -12,4 +12,4 @@ queries (Guzzler provides an SQL query parser based on ZQL) and may decide
 to update counters, fire off events, log messages, etc.
 
 ZQL: http://www.gibello.com/code/zql/
-=====================================
+
