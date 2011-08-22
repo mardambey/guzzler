@@ -34,11 +34,11 @@ class RabbitMQDeliveryConsumer extends Actor {
   val rabbitMQ = new RabbitMQ
   rabbitMQ.start()
   rabbitMQ ! Connect("localhost")
-  rabbitMQ ! CreateChannelWithExchange(DATABASE_EXCHANGE, "topic")
+  rabbitMQ ! CreateChannelWithExchange(DATABASE, DATABASE_EXCHANGE, "topic")
 
   def getKey(table:String, op:String) : String = DATABASE + "." + table + "." + op
 
-  def beamOff(data:Array[Byte], table:String, op:String) { rabbitMQ ! SendExchange(data, DATABASE_EXCHANGE, getKey(table, op)) }
+  def beamOff(data:Array[Byte], table:String, op:String) { rabbitMQ ! SendExchange(data, DATABASE, DATABASE_EXCHANGE, getKey(table, op)) }
 
   def act() {
     loop {

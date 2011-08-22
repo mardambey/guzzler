@@ -27,6 +27,13 @@ import java.io.ByteArrayInputStream
 import net.lag.logging.Logger
 
 /**
+ * TODO:
+ * - add guaranteed exchangers and queues with message ACKs + durability
+ * - add pause ability that will hold bin logs locally
+ *   until un-paused
+ */
+
+/**
  * Guzzler - streams binary logs from a remote MySQL
  * server and parses statements handing them off
  * to consumers (Actors) for asynchronous processing.
