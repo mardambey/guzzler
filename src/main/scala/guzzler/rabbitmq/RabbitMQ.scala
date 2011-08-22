@@ -29,10 +29,20 @@ import scala.collection.JavaConversions._
 
 
 case class Connect(rabbitHost: String)
-case class AddChannel(rabbitQueue:String)
-case class Reconnect()
+//case class Reconnect()
 case class Disconnect()
-case class Send(obj: Array[Byte], channel:String)
+case class CreateChannelWithQueue(queue:String)
+case class CreateChannelWithExchange(exchangeName:String, exchangeType:String)
+case class SendQueue(obj: Array[Byte], queue:String)
+case class SendExchange(obj: Array[Byte], exchange:String, routingKey:String)
+
+/**
+ * TODO:
+ * - add message acknowledgements to rabbitmq
+ * - add fanout and guaranteed exhangers and queues
+ * - add pause ability that will hold bin logs locally
+ *   until unpaused
+ */
 
 /**
  * Handles all the interaction with the RabbitMQ server.
@@ -45,25 +55,42 @@ class RabbitMQ extends Actor {
   var channels = new JCMap[String, Option[Channel]]()
   var connection:Option[Connection] = None
 
+  /**
+   * Connects to a RabbitMQ server at the given host.
+   */
   def connect(rabbitHost: String) : Boolean = {
     this.rabbitHost = Some(rabbitHost)
     _connect()
     true
   }
 
-  def addChannel(c:String) {
+  /**
+   * Creates a channel and declares an exchange on it
+   * given its name and type.
+   */
+  def createChannelWithExchange(exchangeName:String, exchangeType:String) {
     val channel = Some(connection.get.createChannel())
-    channels(c) = channel
+    channel.get.exchangeDeclare(exchangeName, exchangeType)
+    channels(exchangeName) = channel
+  }
+
+  /**
+   * Creates a channel and declares a queue on
+   * it given its name.
+   */
+  def createChannelWithQueue(c:String) {
+    val channel = Some(connection.get.createChannel())
     channel.get.queueDeclare(c, false, false, false, null)
+    channels(c) = channel
   }
 
-  def recreateChannels() { channels.foreach(c => { addChannel(c._1) }) }
+  //def recreateChannels() { channels.foreach(c => { createChannelWithQueue(c._1) }) }
 
-  def reconnect() : Boolean = {
-    val ret = _connect()
-    recreateChannels()
-    ret
-  }
+  //def reconnect() : Boolean = {
+  //  val ret = _connect()
+  //  recreateChannels()
+  //  ret
+  //}
 
   // TODO: report errors and implement reconnect logic
   def _connect() : Boolean = {
@@ -99,15 +126,25 @@ class RabbitMQ extends Actor {
   def act() {
     loop {
       react {
-        case AddChannel(channel:String) => addChannel(channel)
+        case CreateChannelWithQueue(queue:String) => createChannelWithQueue(queue)
+        case CreateChannelWithExchange(exchange:String, exchangeType:String) => createChannelWithExchange(exchange, exchangeType)
         case Connect(host:String) => connect(host)
         case Disconnect() => disconnect()
-        case Reconnect() => reconnect()
-        case Send(obj, chan) => {
-          channels(chan) match {
+        //case Reconnect() => reconnect()
+        case SendQueue(obj, queue) => {
+          channels(queue) match {
             case None =>
             case Some(channel) => {
-              try { channel.basicPublish("", chan, null, obj) }
+              try { channel.basicPublish("", queue, null, obj) }
+              catch { case e: Exception => logger.error(e, "Exception caught while publishing.") }
+            }
+          }
+        }
+        case SendExchange(obj, exchange, routingKey) => {
+          channels(exchange) match {
+            case None =>
+            case Some(channel) => {
+              try { channel.basicPublish(exchange, routingKey, null, obj) }
               catch { case e: Exception => logger.error(e, "Exception caught while publishing.") }
             }
           }

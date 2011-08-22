@@ -24,7 +24,7 @@ import scala.sys.process.ProcessIO
 import java.lang.StringBuffer
 import org.gibello.zql._
 import java.io.ByteArrayInputStream
-import guzzler.consumers.Statement
+import net.lag.logging.Logger
 
 /**
  * Guzzler - streams binary logs from a remote MySQL
@@ -33,6 +33,7 @@ import guzzler.consumers.Statement
  */
 object Guzzler extends App {
 
+  // TODO: get this from the env too
   Config.load("guzzler.conf")
 
   val binLogPositionCmd = Config.mysqlCmd.get
@@ -67,16 +68,22 @@ object Guzzler extends App {
         case _ =>
       }
     }),
+    // FIXME: either remove this or do something useful with it
     stderr => scala.io.Source.fromInputStream(stderr).getLines().foreach(println))
 
   val binLogStreamProc = binLogStreamProcBuilder.run(binLogStreamIO)
   val binLogStreamExitCode = binLogStreamProc.exitValue()
 }
 
+case class Statement(s:ZStatement)
+
 object Util {
+
+  val logger = Logger.get
 
   def processSql(sql:String) {
     val parser = new ZqlParser()
+    // FIXME: this is an ugly hack
     val scrubbedSql = sql.replaceAll("""\\'""", "") + ";"
     parser.initParser(new ByteArrayInputStream(scrubbedSql.getBytes))
 
@@ -84,7 +91,7 @@ object Util {
       val statement = parser.readStatement()
       Config.consumers.foreach(_ ! Statement(statement))
     } catch {
-      case e:Exception => println("Exception caught while parsing SQL '" + scrubbedSql + "': " + e.getMessage)
+      case e:Exception => logger.error(e, "Exception caught while parsing SQL '" + scrubbedSql)
     }
   }
 }
