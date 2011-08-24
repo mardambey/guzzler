@@ -22,19 +22,48 @@ package guzzler.consumers
 import actors.Actor
 import org.gibello.zql._
 import guzzler.rabbitmq._
-import guzzler.Statement
+import guzzler.{Config, Statement}
+import java.lang.Exception
+import net.lag.logging.Logger
+import net.lag.configgy.ConfigMap
 
+/**
+ * Accepts bin log messages and pushes them into
+ * RabbitMQ. Messages are associated with routing
+ * keys that can be filtered by consumers. Keys
+ * are built in the form "db.table.op" where db
+ * and table are the database and corresponding
+ * table, and op is one of insert, update, and
+ * delete.
+ */
 class RabbitMQDeliveryConsumer extends Actor {
 
-  val DATABASE = "messaging"
-  val DATABASE_EXCHANGE = DATABASE + "_binlogs"
+  val logger = Logger.get
+  var DATABASE:String = _
+  var DATABASE_EXCHANGE:String = _
+  val rabbitMQ = new RabbitMQ
+
+  val config:ConfigMap = {
+    try {
+      val conf = Config.config.getConfigMap("rabbitMQDeliveryConsumer").get
+      DATABASE = conf.getString("database").get
+      DATABASE_EXCHANGE = DATABASE + "_" + conf.getString("exchange").get
+      rabbitMQ.start()
+      rabbitMQ ! Connect(conf.getString("host").get)
+      rabbitMQ ! CreateChannelWithExchange(DATABASE, DATABASE_EXCHANGE, "topic")
+      conf
+    } catch {
+      case _ => {
+        logger.error("RabbitMQDeliveryConsumer: Could not load configuration.")
+        throw new Exception("RabbitMQDeliveryConsumer: Could not load configuration.")
+
+      }
+    }
+  }
+
   val INSERT = "insert"
   val UPDATE = "update"
   val DELETE = "delete"
-  val rabbitMQ = new RabbitMQ
-  rabbitMQ.start()
-  rabbitMQ ! Connect("localhost")
-  rabbitMQ ! CreateChannelWithExchange(DATABASE, DATABASE_EXCHANGE, "topic")
 
   def getKey(table:String, op:String) : String = DATABASE + "." + table + "." + op
 

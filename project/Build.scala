@@ -50,6 +50,7 @@ object Dependencies {
   val configgy = "net.lag" % "configgy" % "2.0.0" intransitive()
   val slf4j = "org.slf4j" % "slf4j-simple" % "1.6.1"
   val rabbitmqClient = "com.rabbitmq" % "amqp-client" % "2.5.1"
+  val ssh = "org.apache.sshd" % "apache-sshd" % "0.5.0"
 }
 
 object GuzzlerBuild extends Build {
@@ -58,7 +59,7 @@ object GuzzlerBuild extends Build {
   import BuildSettings._
 
 	val deps = Seq (
-		configgy, slf4j, rabbitmqClient
+		configgy, slf4j, rabbitmqClient, ssh
 	)
 
   lazy val guzzler = Project (

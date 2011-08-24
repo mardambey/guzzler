@@ -21,10 +21,19 @@ package guzzler
 
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
-import java.lang.StringBuffer
 import org.gibello.zql._
-import java.io.ByteArrayInputStream
 import net.lag.logging.Logger
+import actors.Actor
+import actors.Futures._
+import org.apache.sshd._
+import common.{NamedFactory, Factory}
+import server.auth.UserAuthNone
+import server.keyprovider.SimpleGeneratorHostKeyProvider
+import java.io._
+import collection.JavaConversions._
+import server.{UserAuth, Environment, ExitCallback, Command}
+import java.lang.StringBuffer
+import scala.Int
 
 /**
  * TODO:
@@ -42,6 +51,9 @@ object Guzzler extends App {
 
   // TODO: get this from the env too
   Config.load("guzzler.conf")
+
+  val sshd = new Sshd(2222, "/tmp/guzzler.ser")
+  sshd.start()
 
   val binLogPositionCmd = Config.mysqlCmd.get
   val binLogStdout = new StringBuffer()
@@ -101,4 +113,111 @@ object Util {
       case e:Exception => logger.error(e, "Exception caught while parsing SQL '" + scrubbedSql)
     }
   }
+}
+
+class Subscribe(actor:Actor, event:String)
+
+class Sshd(port:Int, hostKey:String) extends Actor {
+
+  def act() {
+
+    future {
+      val sshd = SshServer.setUpDefaultServer()
+      sshd.setPort(port);
+      sshd.setKeyPairProvider(new SimpleGeneratorHostKeyProvider(hostKey))
+      sshd.setShellFactory((new ShellFactory()).asInstanceOf[Factory[Command]])
+      sshd.setUserAuthFactories(List(new UserAuthNone.Factory().asInstanceOf[NamedFactory[UserAuth]]))
+      sshd.start()
+    }
+
+    loop {
+      react {
+        case _ =>
+      }
+    }
+  }
+}
+
+class ShellFactory extends Factory[Shell] {
+  override def create() : Shell = {
+    new Shell()
+  }
+}
+
+class Shell extends Command {
+
+  var alive = true
+  lazy val actor = new Actor() {
+
+    val reader = new BufferedReader(new InputStreamReader(in.get))
+
+    def readLine() : Option[String] = {
+
+      try {
+        Some(reader.readLine())
+      } catch {
+        case _ => None
+      }
+    }
+
+    def act() {
+
+      val reader = future {
+        var reading = true
+        while(reading) {
+          readLine() match {
+            case None => {
+              reading = false
+              exitCallback.get.onExit(0)
+              exit()
+            }
+            case Some("exit") => {
+              out.get.write(("See you!\r\n").getBytes)
+              out.get.flush()
+              out.get.close()
+              exitCallback.get.onExit(0)
+              exit()
+            }
+            case Some(cmd:String) => {
+              out.get.write(("You sent: " + cmd + "\r\n").getBytes)
+              out.get.flush()
+            }
+          }
+        }
+      }
+
+      loop {
+        react {
+          case "Exit" => {
+            out.get.close()
+            reader()
+            exit()
+          }
+        }
+      }
+    }
+  }
+
+  var in:Option[InputStream] = None
+  var out:Option[OutputStream] = None
+  var err:Option[OutputStream] = None
+  var exitCallback:Option[ExitCallback] = None
+
+  def destroy() {
+    actor ! "Exit"
+  }
+
+  def start(env: Environment) {
+    out.get.write("\r\n -=[ Welcome to Guzzler ]=-\r\n\r\n".getBytes)
+    out.get.flush()
+    actor.start()
+  }
+
+  def setExitCallback(callback: ExitCallback) { this.exitCallback = Some(callback) }
+
+  def setErrorStream(err: OutputStream) { this.err = Some(err) }
+
+  def setOutputStream(out: OutputStream) { this.out = Some(out) }
+
+  def setInputStream(in: InputStream) { this.in = Some(in) }
 }

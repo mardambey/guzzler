@@ -19,12 +19,13 @@
 
 package guzzler
 
-import net.lag.configgy.Configgy
 import net.lag.logging.Logger
 import actors.Actor
+import net.lag.configgy.Configgy
 
 object Config {
 
+  var config:net.lag.configgy.Config = _
   val log = Logger.get
   var defaultContentType:String = ""
   val consumers = scala.collection.mutable.Set[Actor]()
@@ -35,17 +36,13 @@ object Config {
   var mysqlDb:Option[String] = None
   var mysqlCmd:Option[String] = None
   var mysqlBinlogStreamer:Option[String] = None
-
-  var rabbitHost:Option[String] = None
-
+  var mysqlSlaveServerId:Option[String] = None
 
   val DEFAULT_CONSUMER_PACKAGE = ""
 
   def load(file:String) : Boolean = {
     Configgy.configure(file)
-    val config = Configgy.config
-
-    rabbitHost = config.getString("rabbitMQHost")
+    config = Configgy.config
 
     mysqlHost = config.getString("mysqlHost")
     mysqlUser = config.getString("mysqlUser")
@@ -53,6 +50,7 @@ object Config {
     mysqlDb = config.getString("mysqlDb")
     mysqlCmd = config.getString("mysqlCmd")
     mysqlBinlogStreamer = config.getString("mysqlBinlogStreamer")
+    mysqlSlaveServerId = config.getString("mysqlSlaveServerId")
 
     // get list holding consumers
     val consumerCfg = config.getList("consumers")
