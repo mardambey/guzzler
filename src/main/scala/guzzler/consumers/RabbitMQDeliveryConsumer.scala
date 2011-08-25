@@ -22,10 +22,11 @@ package guzzler.consumers
 import actors.Actor
 import org.gibello.zql._
 import guzzler.rabbitmq._
-import guzzler.{Config, Statement}
 import java.lang.Exception
 import net.lag.logging.Logger
 import net.lag.configgy.ConfigMap
+import guzzler._
+import ssh.{SshdMessage, SshdSubscribe}
 
 /**
  * Accepts bin log messages and pushes them into
@@ -70,8 +71,15 @@ class RabbitMQDeliveryConsumer extends Actor {
   def beamOff(data:Array[Byte], table:String, op:String) { rabbitMQ ! SendExchange(data, DATABASE, DATABASE_EXCHANGE, getKey(table, op)) }
 
   def act() {
+
+    // register with the sshd server to receive commands
+    Guzzler.sshd ! SshdSubscribe(this, "rabbitmq")
+
     loop {
       react {
+        case SshdMessage(msg) => {
+          logger.info("RabbitMQDeliveryConsumer: Got an ssh message: " + msg)
+        }
         case Statement(s) => {
           s match {
             case q:ZInsert => {

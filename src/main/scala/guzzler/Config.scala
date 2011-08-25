@@ -38,12 +38,16 @@ object Config {
   var mysqlBinlogStreamer:Option[String] = None
   var mysqlSlaveServerId:Option[String] = None
 
+  var sshdPort:Option[Int] = None
+  var sshdHostKeyPath:Option[String] = None
+
   val DEFAULT_CONSUMER_PACKAGE = ""
 
   def load(file:String) : Boolean = {
     Configgy.configure(file)
     config = Configgy.config
 
+    // mysql configuration
     mysqlHost = config.getString("mysqlHost")
     mysqlUser = config.getString("mysqlUser")
     mysqlPassword = config.getString("mysqlPassword")
@@ -51,6 +55,10 @@ object Config {
     mysqlCmd = config.getString("mysqlCmd")
     mysqlBinlogStreamer = config.getString("mysqlBinlogStreamer")
     mysqlSlaveServerId = config.getString("mysqlSlaveServerId")
+
+    // sshd configuration
+    sshdPort = config.getInt("sshdPort")
+    sshdHostKeyPath = config.getString("sshdHostKeyPath")
 
     // get list holding consumers
     val consumerCfg = config.getList("consumers")
@@ -62,7 +70,6 @@ object Config {
       log.ifDebug("Loading consumer: " + defaultConsumerPackage + "." + c)
       try {
       val actor = Class.forName(defaultConsumerPackage + "." + c).newInstance().asInstanceOf[Actor]
-      actor.start()
       consumers += actor
       } catch {
         case e:Exception => log.ifError(e, "Error loading consumer " + c)

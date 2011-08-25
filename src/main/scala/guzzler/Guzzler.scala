@@ -23,17 +23,9 @@ import scala.sys.process.Process
 import scala.sys.process.ProcessIO
 import org.gibello.zql._
 import net.lag.logging.Logger
-import actors.Actor
-import actors.Futures._
-import org.apache.sshd._
-import common.{NamedFactory, Factory}
-import server.auth.UserAuthNone
-import server.keyprovider.SimpleGeneratorHostKeyProvider
 import java.io._
-import collection.JavaConversions._
-import server.{UserAuth, Environment, ExitCallback, Command}
 import java.lang.StringBuffer
-import scala.Int
+import ssh.Sshd
 
 /**
  * TODO:
@@ -50,11 +42,17 @@ import scala.Int
 object Guzzler extends App {
 
   // TODO: get this from the env too
+  // load configuration
   Config.load("guzzler.conf")
 
-  val sshd = new Sshd(2222, "/tmp/guzzler.ser")
+  // start sshd
+  val sshd = new Sshd(Config.sshdPort.get, Config.sshdHostKeyPath.get)
   sshd.start()
 
+  // start consumers
+  Config.consumers.foreach(_.start())
+
+  // find the current position of the binlog to stream
   val binLogPositionCmd = Config.mysqlCmd.get
   val binLogStdout = new StringBuffer()
   val binLogProcBuilder = Process(binLogPositionCmd, List("-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-h" + Config.mysqlHost.get, Config.mysqlDb.get, "-eshow master status"))
@@ -68,6 +66,7 @@ object Guzzler extends App {
   val binLogexitCode = binLogProc.exitValue()
   val binLogFilePosition = binLogStdout.toString.split("Binlog_Ignore_DB")(1).split("""\s+""").slice(0, 2)
 
+  // build and run mysql binlog streamer
   val binLogStreamCmd = Config.mysqlBinlogStreamer.get
   val binLogStreamProcBuilder = Process(binLogStreamCmd, List("-h" + Config.mysqlHost.get, "-P3306", "-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-R", "--start-position=" + binLogFilePosition(1),  "--stop-never" , "-f", binLogFilePosition(0)))
 
@@ -115,109 +114,4 @@ object Util {
   }
 }
 
-class Subscribe(actor:Actor, event:String)
 
-class Sshd(port:Int, hostKey:String) extends Actor {
-
-  def act() {
-
-    future {
-      val sshd = SshServer.setUpDefaultServer()
-      sshd.setPort(port);
-      sshd.setKeyPairProvider(new SimpleGeneratorHostKeyProvider(hostKey))
-      sshd.setShellFactory((new ShellFactory()).asInstanceOf[Factory[Command]])
-      sshd.setUserAuthFactories(List(new UserAuthNone.Factory().asInstanceOf[NamedFactory[UserAuth]]))
-      sshd.start()
-    }
-
-    loop {
-      react {
-        case _ =>
-      }
-    }
-  }
-}
-
-class ShellFactory extends Factory[Shell] {
-  override def create() : Shell = {
-    new Shell()
-  }
-}
-
-class Shell extends Command {
-
-  var alive = true
-  lazy val actor = new Actor() {
-
-    val reader = new BufferedReader(new InputStreamReader(in.get))
-
-    def readLine() : Option[String] = {
-
-      try {
-        Some(reader.readLine())
-      } catch {
-        case _ => None
-      }
-    }
-
-    def act() {
-
-      val reader = future {
-        var reading = true
-        while(reading) {
-          readLine() match {
-            case None => {
-              reading = false
-              exitCallback.get.onExit(0)
-              exit()
-            }
-            case Some("exit") => {
-              out.get.write(("See you!\r\n").getBytes)
-              out.get.flush()
-              out.get.close()
-              exitCallback.get.onExit(0)
-              exit()
-            }
-            case Some(cmd:String) => {
-              out.get.write(("You sent: " + cmd + "\r\n").getBytes)
-              out.get.flush()
-            }
-          }
-        }
-      }
-
-      loop {
-        react {
-          case "Exit" => {
-            out.get.close()
-            reader()
-            exit()
-          }
-        }
-      }
-    }
-  }
-
-  var in:Option[InputStream] = None
-  var out:Option[OutputStream] = None
-  var err:Option[OutputStream] = None
-  var exitCallback:Option[ExitCallback] = None
-
-  def destroy() {
-    actor ! "Exit"
-  }
-
-  def start(env: Environment) {
-    out.get.write("\r\n -=[ Welcome to Guzzler ]=-\r\n\r\n".getBytes)
-    out.get.flush()
-    actor.start()
-  }
-
-  def setExitCallback(callback: ExitCallback) { this.exitCallback = Some(callback) }
-
-  def setErrorStream(err: OutputStream) { this.err = Some(err) }
-
-  def setOutputStream(out: OutputStream) { this.out = Some(out) }
-
-  def setInputStream(in: InputStream) { this.in = Some(in) }
-}
