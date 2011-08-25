@@ -19,13 +19,16 @@
 
 package guzzler
 
+//import filequeue.PersistentQueue
+import scala.actors.Futures._
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
 import org.gibello.zql._
 import net.lag.logging.Logger
 import java.io._
-import java.lang.StringBuffer
-import ssh.Sshd
+import java.lang.{String, StringBuffer}
+import actors.Actor
+import ssh.{SshdMessage, SshdSubscribe, Sshd}
 
 /**
  * TODO:
@@ -45,9 +48,53 @@ object Guzzler extends App {
   // load configuration
   Config.load("guzzler.conf")
 
+  // logger object
+  val logger = Logger.get
+
   // start sshd
   val sshd = new Sshd(Config.sshdPort.get, Config.sshdHostKeyPath.get)
   sshd.start()
+
+  val sshdSubscriber = new Actor {
+    def act() {
+      loop {
+        react {
+          case SshdMessage(msg) => {
+            msg.stripLineEnd match {
+              case "guzzler pause" => {
+                logger.info("Pausing main queue.")
+                queue ! QueuePause()
+              }
+              case "guzzler resume" => {
+                logger.info("Resuming main queue.")
+                queue.restart()
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  sshdSubscriber.start()
+  sshd ! SshdSubscribe(sshdSubscriber, "guzzler")
+
+  // init queue
+  private case class QueuePause()
+  val queue = new Actor {
+    def act() {
+      loop {
+        react {
+          case QueuePause() => {
+            exit()
+          }
+          case sql:String => {
+            Util.processSql(sql)
+          }
+        }
+      }
+    }
+  }
+  queue.start()
 
   // start consumers
   Config.consumers.foreach(_.start())
@@ -72,13 +119,15 @@ object Guzzler extends App {
 
   val sqlRegex = """(?i)(insert|update|delete) .*""".r
 
+
+
   val binLogStreamIO = new ProcessIO(
     _ => (), // stdin not used
     stdout => scala.io.Source.fromInputStream(stdout).getLines().foreach(line => {
       try {
         line match {
-          case line @ sqlRegex(sql) => {
-            Util.processSql(line)
+          case sqlRegex(sql) => {
+            queue ! line
           }
           case _ =>
         }
@@ -98,20 +147,18 @@ case class Statement(s:ZStatement)
 object Util {
 
   val logger = Logger.get
+  val parser = new ZqlParser()
 
   def processSql(sql:String) {
-    val parser = new ZqlParser()
     // FIXME: this is an ugly hack
     val scrubbedSql = sql.replaceAll("""\\'""", "") + ";"
     parser.initParser(new ByteArrayInputStream(scrubbedSql.getBytes))
 
     try {
       val statement = parser.readStatement()
-      Config.consumers.foreach(_ ! Statement(statement))
+      Config.consumers.par.foreach(_ ! Statement(statement))
     } catch {
       case e:Exception => logger.error(e, "Exception caught while parsing SQL '" + scrubbedSql)
     }
   }
 }
-
-

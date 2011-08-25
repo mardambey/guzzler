@@ -95,8 +95,8 @@ class Shell(sshd:Sshd) extends Command {
 
     def act() {
 
+      var reading = true
       val reader = future {
-        var reading = true
         while(reading) {
           val strBuf = new StringBuffer()
           Stream.continually(in.get.read).takeWhile(_ != -1).foreach(i => {
@@ -110,7 +110,7 @@ class Shell(sshd:Sshd) extends Command {
               }
               case 4 => {
                 strBuf.delete(0, strBuf.length())
-                out.get.write(("*guzzle* *guzzle*!\r\n").getBytes)
+                out.get.write(("\r\n\r\n*guzzle* *guzzle*!\r\n\r\n").getBytes)
                 out.get.flush()
                 out.get.close()
                 exitCallback.get.onExit(0)
@@ -131,6 +131,7 @@ class Shell(sshd:Sshd) extends Command {
       loop {
         react {
           case "Exit" => {
+            reading = false
             out.get.close()
             reader()
             exit()
