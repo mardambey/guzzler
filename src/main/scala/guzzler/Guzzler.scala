@@ -163,10 +163,12 @@ object Guzzler extends App {
 
       var iterate = true
       while (iterate) {
+
         line match {
           case None => {
             // timeout
             iterate = false
+            process.destroy()
             throw new Exception("Caught timeout while reading from mysqlbinlog, restarting from " + snapshotPosition)
           }
           case Some(str) => {
@@ -178,7 +180,7 @@ object Guzzler extends App {
                 case atRegex(position) => {
                   snapshotPosition = position.toLong
                 }
-                case _ =>
+                case ignore =>
               }
             } catch {
               case _ =>
