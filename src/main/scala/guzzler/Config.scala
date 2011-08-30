@@ -31,12 +31,13 @@ object Config {
   val consumers = scala.collection.mutable.Set[Actor]()
 
   var mysqlHost:Option[String] = None
+  var mysqlPort:Option[Int] = None
   var mysqlUser:Option[String] = None
   var mysqlPassword:Option[String] = None
   var mysqlDb:Option[String] = None
   var mysqlCmd:Option[String] = None
   var mysqlBinlogStreamer:Option[String] = None
-  var mysqlSlaveServerId:Option[String] = None
+  var mysqlSlaveServerId:Option[Int] = None
 
   var sshdPort:Option[Int] = None
   var sshdHostKeyPath:Option[String] = None
@@ -49,12 +50,13 @@ object Config {
 
     // mysql configuration
     mysqlHost = config.getString("mysqlHost")
+    mysqlPort = config.getInt("mysqlPort")
     mysqlUser = config.getString("mysqlUser")
     mysqlPassword = config.getString("mysqlPassword")
     mysqlDb = config.getString("mysqlDb")
     mysqlCmd = config.getString("mysqlCmd")
     mysqlBinlogStreamer = config.getString("mysqlBinlogStreamer")
-    mysqlSlaveServerId = config.getString("mysqlSlaveServerId")
+    mysqlSlaveServerId = config.getInt("mysqlSlaveServerId")
 
     // sshd configuration
     sshdPort = config.getInt("sshdPort")

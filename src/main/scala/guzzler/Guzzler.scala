@@ -19,16 +19,18 @@
 
 package guzzler
 
-//import filequeue.PersistentQueue
-import scala.actors.Futures._
+import java.nio.ByteBuffer
+import java.nio.channels.ClosedByInterruptException
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
 import org.gibello.zql._
 import net.lag.logging.Logger
 import java.io._
-import java.lang.{String, StringBuffer}
-import actors.Actor
 import ssh.{SshdMessage, SshdSubscribe, Sshd}
+import actors.{Futures, Actor}
+import actors.Futures._
+import collection.mutable.LinkedList
+import java.lang.{Exception, ProcessBuilder, String, StringBuffer}
 
 /**
  * TODO:
@@ -69,8 +71,10 @@ object Guzzler extends App {
                 logger.info("Resuming main queue.")
                 queue.restart()
               }
+              case ignore =>
             }
           }
+          case ignore =>
         }
       }
     }
@@ -102,44 +106,106 @@ object Guzzler extends App {
   // find the current position of the binlog to stream
   val binLogPositionCmd = Config.mysqlCmd.get
   val binLogStdout = new StringBuffer()
-  val binLogProcBuilder = Process(binLogPositionCmd, List("-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-h" + Config.mysqlHost.get, Config.mysqlDb.get, "-eshow master status"))
+  val binLogProcBuilder = {
+    try {
+      Some(Process(binLogPositionCmd, List("-P" + Config.mysqlPort.get, "-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-h" + Config.mysqlHost.get, Config.mysqlDb.get, "-eshow master status")))
+    } catch {
+      case e:Exception => {
+        logger.error(e, "Could not determine binlog position.")
+        sys.exit(-1)
+        None
+      }
+    }
+  }
 
+  var snapshotPosition:Long = 0
   val binLogIO = new ProcessIO(
     _ => (), // stdin not used
     stdout => scala.io.Source.fromInputStream(stdout).getLines().foreach(binLogStdout.append),
     stderr => scala.io.Source.fromInputStream(stderr).getLines().foreach(binLogStdout.append))
 
-  val binLogProc = binLogProcBuilder.run(binLogIO)
+  val binLogProc = binLogProcBuilder.get.run(binLogIO)
   val binLogexitCode = binLogProc.exitValue()
   val binLogFilePosition = binLogStdout.toString.split("Binlog_Ignore_DB")(1).split("""\s+""").slice(0, 2)
+  var stream = true
 
-  // build and run mysql binlog streamer
-  val binLogStreamCmd = Config.mysqlBinlogStreamer.get
-  val binLogStreamProcBuilder = Process(binLogStreamCmd, List("-h" + Config.mysqlHost.get, "-P3306", "-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-R", "--start-position=" + binLogFilePosition(1),  "--stop-never" , "-f", binLogFilePosition(0)))
+  while (stream) streamBinLog()
 
-  val sqlRegex = """(?i)(insert|update|delete) .*""".r
+  def streamBinLog() {
+    try {
+      // build and run mysql binlog streamer, possibly resuming from a certain position
+      val filePosition = if (snapshotPosition != 0) snapshotPosition else binLogFilePosition(1)
 
+      logger.debug("Starting form binlong " + binLogFilePosition(0) + " at position " + filePosition)
 
+      val binLogStreamCmd = Config.mysqlBinlogStreamer.get
+      val binLogStreamProcBuilder = Process(binLogStreamCmd, List("-h" + Config.mysqlHost.get, "-P" + Config.mysqlPort.get, "-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-R", "--start-position=" + filePosition,  "--stop-never", "--stop-never-slave-server-id=" + Config.mysqlSlaveServerId.get , "-f", binLogFilePosition(0)))
 
-  val binLogStreamIO = new ProcessIO(
-    _ => (), // stdin not used
-    stdout => scala.io.Source.fromInputStream(stdout).getLines().foreach(line => {
-      try {
+      val sqlRegex = """(?i)(insert |update |delete ).*""".r
+      val atRegex = """(?i)# at (\d+)""".r
+
+      val processBuilder = new java.lang.ProcessBuilder(
+        List(binLogStreamCmd,
+          "-h" + Config.mysqlHost.get,
+          "-P" + Config.mysqlPort.get,
+          "-u" + Config.mysqlUser.get,
+          "-p" + Config.mysqlPassword.get,
+          "-R", "--start-position=" + binLogFilePosition(1),
+          "--stop-never",
+          "--stop-never-slave-server-id=" + Config.mysqlSlaveServerId.get ,
+          "-f", binLogFilePosition(0)).foldLeft(new java.util.LinkedList[String]())((list, w) => { list.add(w); list }))
+
+      val process = processBuilder.start()
+      val stdout = process.getInputStream
+
+      val bufferedReader = new BufferedReader(new InputStreamReader(stdout))
+      var line = readLine(bufferedReader)
+
+      var iterate = true
+      while (iterate) {
         line match {
-          case sqlRegex(sql) => {
-            queue ! line
+          case None => {
+            // timeout
+            iterate = false
+            throw new Exception("Caught timeout while reading from mysqlbinlog, restarting from " + snapshotPosition)
           }
-          case _ =>
+          case Some(str) => {
+            try {
+              str match {
+                case sqlRegex(sql) => {
+                  queue ! str
+                }
+                case atRegex(position) => {
+                  snapshotPosition = position.toLong
+                }
+                case _ =>
+              }
+            } catch {
+              case _ =>
+            }
+            line = readLine(bufferedReader)
+          }
         }
-      } catch {
-        case _ =>
       }
-    }),
-    // FIXME: either remove this or do something useful with it
-    stderr => scala.io.Source.fromInputStream(stderr).getLines().foreach(println))
+    } catch {
+      case e:Exception => {
+        logger.error(e, "Could not stream binary logs.")
+      }
+    }
+  }
 
-  val binLogStreamProc = binLogStreamProcBuilder.run(binLogStreamIO)
-  val binLogStreamExitCode = binLogStreamProc.exitValue()
+  def readLine(bufferedReader:BufferedReader) : Option[String] = {
+    val f = future {
+      Some(bufferedReader.readLine())
+    }
+
+    val results = Futures.awaitAll(2000, f).map(_ match {
+      case s @ Some(str) => str
+      case error => None
+    }).asInstanceOf[List[Option[String]]]
+
+    results.head
+  }
 }
 
 case class Statement(s:ZStatement)
