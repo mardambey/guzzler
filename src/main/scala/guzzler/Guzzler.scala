@@ -19,18 +19,14 @@
 
 package guzzler
 
-import java.nio.ByteBuffer
-import java.nio.channels.ClosedByInterruptException
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
 import org.gibello.zql._
 import net.lag.logging.Logger
-import java.io._
 import ssh.{SshdMessage, SshdSubscribe, Sshd}
 import actors.{Futures, Actor}
 import actors.Futures._
-import collection.mutable.LinkedList
-import java.lang.{Exception, ProcessBuilder, String, StringBuffer}
+import java.io.{ByteArrayInputStream, InputStreamReader, BufferedReader}
 
 /**
  * TODO:
@@ -71,6 +67,12 @@ object Guzzler extends App {
                 logger.info("Resuming main queue.")
                 queue.restart()
               }
+              case "guzzler state" => {
+                logger.info(" [guzzler] Current queue state is " + queue.getState)
+              }
+              case "guzzler stream restart" => {
+                logger.info(" [guzzler] Received request to restart binlog streaming.")
+              }
               case ignore =>
             }
           }
@@ -82,9 +84,82 @@ object Guzzler extends App {
   sshdSubscriber.start()
   sshd ! SshdSubscribe(sshdSubscriber, "guzzler")
 
-  // init queue
+  // pauses the queue, consumers stop getting messages
   private case class QueuePause()
-  val queue = new Actor {
+  // shows the state of the queue
+  private case class QueueState()
+  // restarts the binlog streaming process
+  private case class StreamRestart()
+
+  // holds the current binlog snapshot
+  var snapshotPosition:Long = 0
+
+  // holds messages on their way out to consumers
+  val queue = createMessageQueue()
+  queue.start()
+
+  // start consumers
+  Config.consumers.foreach(_.start())
+
+  // find the current name and position of the binlog to stream
+  var binLogFilePosition = getBinLogCurrentPosition.getOrElse({die("Could not get current binlog position.")}).asInstanceOf[Array[String]]
+  var stream = true
+
+  // if set to true, the first record will be
+  // skipped using --offset=1 in mysqlbinlog
+  // this is used when theres a recovery from
+  // a crash or a restart of the streamer
+  var skipRecord = false
+
+  // stream binlogs until interrupted
+  while (stream) {
+    // if we're here then we either need to
+    // restart or we need to exit
+    streamBinLog(binLogFilePosition, skipRecord) match {
+      case true => {
+
+        var keepTrying = true
+        var results:Option[List[Array[String]]] = None
+
+        for (i <- 1 to Config.maxReconnectAttempts.get if keepTrying) {
+          logger.info(" [guzzler] Determining location to stream from (attempt " + i + " or " + Config.maxReconnectAttempts.get + ")")
+          val f = future { getBinLogCurrentPosition.get }
+          results = Some(Futures.awaitAll(2000, f).map(_ match {
+              case s @ Some(arr:Array[String]) => { keepTrying = false; arr }
+              case error => None
+          }).asInstanceOf[List[Array[String]]])
+        }
+
+        results match {
+          case None => die("Could not determine the current binary log position, last good position is " + binLogFilePosition(0) + " -> " + binLogFilePosition(1))
+          case _ =>
+        }
+
+        val curBinLogPosition = results.get(0)
+
+        binLogFilePosition(0) = curBinLogPosition(0)
+        binLogFilePosition(1) = snapshotPosition.toString
+        logger.info(" [guzzler] Resuming from binlog file " + binLogFilePosition(0) +
+          " from position " + snapshotPosition +
+          " (current server position: " + curBinLogPosition(1) + ")")
+
+        // grace period
+        Thread.sleep(2000)
+      }
+      case false => {
+        stream = false
+        die(" [guzzler] Not resuming, exiting.")
+      }
+    }
+
+    // being here means we either
+    // crashed or were restarted,
+    // in both cases skip the first
+    // record that is received
+    skipRecord = true
+  }
+
+  def createMessageQueue() : Actor = new Actor {
     def act() {
       loop {
         react {
@@ -92,54 +167,40 @@ object Guzzler extends App {
             exit()
           }
           case sql:String => {
-            Util.processSql(sql)
+            try {
+              Util.processSql(sql)
+            } catch {
+              case e:Exception => logger.error(e, "Could not process SQL: " + sql)
+              case ignore => logger.error("Could not process SQL (unknown error): " + sql + " -> " + ignore)
+            }
           }
+          case _ =>
         }
       }
     }
   }
-  queue.start()
 
-  // start consumers
-  Config.consumers.foreach(_.start())
-
-  // find the current position of the binlog to stream
-  val binLogPositionCmd = Config.mysqlCmd.get
-  val binLogStdout = new StringBuffer()
-  val binLogProcBuilder = {
-    try {
-      Some(Process(binLogPositionCmd, List("-P" + Config.mysqlPort.get, "-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-h" + Config.mysqlHost.get, Config.mysqlDb.get, "-eshow master status")))
-    } catch {
-      case e:Exception => {
-        logger.error(e, "Could not determine binlog position.")
-        sys.exit(-1)
-        None
-      }
-    }
-  }
-
-  var snapshotPosition:Long = 0
-  val binLogIO = new ProcessIO(
-    _ => (), // stdin not used
-    stdout => scala.io.Source.fromInputStream(stdout).getLines().foreach(binLogStdout.append),
-    stderr => scala.io.Source.fromInputStream(stderr).getLines().foreach(binLogStdout.append))
-
-  val binLogProc = binLogProcBuilder.get.run(binLogIO)
-  val binLogexitCode = binLogProc.exitValue()
-  val binLogFilePosition = binLogStdout.toString.split("Binlog_Ignore_DB")(1).split("""\s+""").slice(0, 2)
-  var stream = true
-
-  while (stream) streamBinLog()
-
-  def streamBinLog() {
+  def streamBinLog(binLogFilePosition:Array[String], skipRecord:Boolean = false) : Boolean = {
     try {
       // build and run mysql binlog streamer, possibly resuming from a certain position
-      val filePosition = if (snapshotPosition != 0) snapshotPosition else binLogFilePosition(1)
-
-      logger.debug("Starting form binlong " + binLogFilePosition(0) + " at position " + filePosition)
+      logger.info(" [guzzler] Starting form binlong " + binLogFilePosition(0) + " at position " + binLogFilePosition(1))
 
       val binLogStreamCmd = Config.mysqlBinlogStreamer.get
-      val binLogStreamProcBuilder = Process(binLogStreamCmd, List("-h" + Config.mysqlHost.get, "-P" + Config.mysqlPort.get, "-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-R", "--start-position=" + filePosition,  "--stop-never", "--stop-never-slave-server-id=" + Config.mysqlSlaveServerId.get , "-f", binLogFilePosition(0)))
+      val args = List(
+        "-h" + Config.mysqlHost.get,
+        "-P" + Config.mysqlPort.get,
+        "-u" + Config.mysqlUser.get,
+        "-p" + Config.mysqlPassword.get,
+        "-R", "--start-position=" + binLogFilePosition(1),
+        "--stop-never",
+        "--stop-never-slave-server-id=" + Config.mysqlSlaveServerId.get ,
+        "-f", binLogFilePosition(0)) ++ (skipRecord match {
+        case true => List("--offset=1")
+        case _ => List[String]()})
+
+      if (skipRecord) logger.info(" [guzzler] Skipping the first record in the binlog.")
+
+      val binLogStreamProcBuilder = Process(binLogStreamCmd, args)
 
       val sqlRegex = """(?i)(insert |update |delete ).*""".r
       val atRegex = """(?i)# at (\d+)""".r
@@ -162,14 +223,16 @@ object Guzzler extends App {
       var line = readLine(bufferedReader)
 
       var iterate = true
-      while (iterate) {
 
+      logger.info(" [guzzler] Guzzling down binary logs *guzzle* *guzzle*")
+
+      while (iterate) {
         line match {
           case None => {
             // timeout
             iterate = false
             process.destroy()
-            throw new Exception("Caught timeout while reading from mysqlbinlog, restarting from " + snapshotPosition)
+            throw new Exception(" [guzzler] Caught timeout while reading from mysqlbinlog at position " + snapshotPosition)
           }
           case Some(str) => {
             try {
@@ -189,9 +252,52 @@ object Guzzler extends App {
           }
         }
       }
+      false
     } catch {
       case e:Exception => {
-        logger.error(e, "Could not stream binary logs.")
+        logger.error(e, " [guzzler] Could not stream binary logs.")
+        true
+      }
+    }
+  }
+
+  def die(msg:String, e:Option[Exception] = None) {
+    e match {
+      case Some(e) => logger.error(e, msg)
+      case any => logger.error(msg)
+    }
+
+    sys.exit(-1)
+  }
+
+  def getBinLogCurrentPosition : Option[Array[String]] = {
+    val binLogPositionCmd = Config.mysqlCmd.get
+    val binLogStdout = new StringBuffer()
+    val binLogProcBuilder = {
+      try {
+        Some(Process(binLogPositionCmd, List("-P" + Config.mysqlPort.get, "-u" + Config.mysqlUser.get, "-p" + Config.mysqlPassword.get, "-h" + Config.mysqlHost.get, Config.mysqlDb.get, "-eshow master status")))
+      } catch {
+        case e:Exception => {
+          logger.error(e, " [guzzler] Could not determine binlog position.")
+          None
+        }
+      }
+    }
+
+    binLogProcBuilder match {
+      case Some(procBuilder) => {
+        val binLogIO = new ProcessIO(
+          _ => (), // stdin not used
+          stdout => scala.io.Source.fromInputStream(stdout).getLines().foreach(binLogStdout.append),
+          stderr => scala.io.Source.fromInputStream(stderr).getLines().foreach(binLogStdout.append))
+
+        val binLogProc = binLogProcBuilder.get.run(binLogIO)
+        val binLogexitCode = binLogProc.exitValue()
+        val binLogFilePosition = binLogStdout.toString.split("Binlog_Ignore_DB")(1).split("""\s+""").slice(0, 2)
+        Some(binLogFilePosition)
+      }
+      case error => {
+        None
       }
     }
   }
@@ -226,7 +332,8 @@ object Util {
       val statement = parser.readStatement()
       Config.consumers.par.foreach(_ ! Statement(statement))
     } catch {
-      case e:Exception => logger.error(e, "Exception caught while parsing SQL '" + scrubbedSql)
+      case e:Exception => logger.error(e, " [guzzler] Exception caught while parsing SQL '" + scrubbedSql)
+      case ignore => logger.error(" [guzzler] Could not process SQL (unknown error): " + scrubbedSql + " -> " + ignore)
     }
   }
 }

@@ -30,6 +30,8 @@ object Config {
   var defaultContentType:String = ""
   val consumers = scala.collection.mutable.Set[Actor]()
 
+  var maxReconnectAttempts:Option[Int] = None
+
   var mysqlHost:Option[String] = None
   var mysqlPort:Option[Int] = None
   var mysqlUser:Option[String] = None
@@ -47,6 +49,9 @@ object Config {
   def load(file:String) : Boolean = {
     Configgy.configure(file)
     config = Configgy.config
+
+    // max number of reconnection attempts
+    maxReconnectAttempts = config.getInt("maxReconnectAttempts")
 
     // mysql configuration
     mysqlHost = config.getString("mysqlHost")
