@@ -76,11 +76,11 @@ class GuzzlerSshdSubscriber extends Actor {
       react {
         case SshdMessage(msg) => {
           msg.stripLineEnd match {
-            case "guzzler pause" => {
+            case "guzzler queue pause" => {
               logger.info(" [guzzler] Pausing main queue.")
               Guzzler.getStreamer ! QueuePause()
             }
-            case "guzzler resume" => {
+            case "guzzler queue resume" => {
               logger.info(" [guzzler] Resuming main queue.")
               Guzzler.getStreamer ! QueueResume()
             }
