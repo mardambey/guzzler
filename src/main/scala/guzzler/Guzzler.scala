@@ -21,13 +21,13 @@ package guzzler
 
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
-import scala.actors.Futures._
 import org.gibello.zql._
 import net.lag.logging.Logger
 import ssh.{SshdMessage, SshdSubscribe, Sshd}
 import java.io.{ByteArrayInputStream, InputStreamReader, BufferedReader}
 import akka.actor.{ActorRef, Actor}
-import actors.{Futures, Future}
+import akka.dispatch.{Futures, Future}
+import akka.util.Duration
 
 /**
  * Guzzler - streams binary logs from a remote MySQL
@@ -357,7 +357,7 @@ class GuzzlerBinlogStreamer extends Actor {
    * TODO: make this retry first before reconnecting
    */
   def readLine(bufferedReader:BufferedReader) : Option[String] = {
-    val f = future {
+    val f = Future {
       Some(bufferedReader.readLine())
     }
 
@@ -406,7 +406,7 @@ class GuzzlerBinlogStreamer extends Actor {
             if (seekFile.equals(SEEK_FILE_EMPTY) && seekPosition > SEEK_POSITION_EMPTY) {
                results = Some(List(Array[String](seekFile, seekPosition.toString)))
             } else {
-              val f = future { getBinLogCurrentPosition.get }
+              val f = Future { getBinLogCurrentPosition.get }
               // TODO: make timeout configurable
               results = Some(Futures.awaitAll(2000, f).map(_ match {
                   case s @ Some(arr:Array[String]) => { keepTrying = false; arr }
@@ -463,7 +463,7 @@ class GuzzlerBinlogStreamer extends Actor {
   }
 
   def startStreaming(binLogFile:String, binLogPosition:Long) {
-    streamer = Some(future {
+    streamer = Some(Future {
       stream(binLogFile, binLogPosition)
     })
   }
@@ -488,7 +488,7 @@ class GuzzlerBinlogStreamer extends Actor {
       // wait for the streamer to exit or kill it
       // if it times out
       // TODO: make this configurable
-      Futures.awaitAll(2000, streamer.get)
+      try { streamer.get.await(Duration("2 seconds")) } catch { case e:Exception => logger.error(e, " [guzzler] Streamer did not stop, timed out after 2 seconds.")}
 
       streamer = None
     }
