@@ -21,12 +21,13 @@ package guzzler
 
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
+import scala.actors.Futures._
 import org.gibello.zql._
 import net.lag.logging.Logger
 import ssh.{SshdMessage, SshdSubscribe, Sshd}
-import actors.{Futures, Actor}
-import actors.Futures._
 import java.io.{ByteArrayInputStream, InputStreamReader, BufferedReader}
+import akka.actor.{ActorRef, Actor}
+import actors.{Futures, Future}
 
 /**
  * Guzzler - streams binary logs from a remote MySQL
@@ -49,11 +50,11 @@ object Guzzler extends App {
   // start consumers
   Config.consumers.foreach(_.start())
 
-  val sshdSubscriber = new GuzzlerSshdSubscriber()
+  val sshdSubscriber = Actor.actorOf[GuzzlerSshdSubscriber]
   sshdSubscriber.start()
   sshd ! SshdSubscribe(sshdSubscriber, "guzzler")
 
-  val streamer = new GuzzlerBinlogStreamer()
+  val streamer = Actor.actorOf[GuzzlerBinlogStreamer]
   streamer.start()
 
   def getStreamer = streamer
@@ -71,45 +72,41 @@ class GuzzlerSshdSubscriber extends Actor {
   // regex used to seek to the given file and position
   val streamSeek = "guzzler stream seek (.*?) (.*?)$".r
 
-  def act() {
-    loop {
-      react {
-        case SshdMessage(msg) => {
-          msg.stripLineEnd match {
-            case "guzzler queue pause" => {
-              logger.info(" [guzzler] Pausing main queue.")
-              Guzzler.getStreamer ! QueuePause()
-            }
-            case "guzzler queue resume" => {
-              logger.info(" [guzzler] Resuming main queue.")
-              Guzzler.getStreamer ! QueueResume()
-            }
-            //case "guzzler state" => {
-            //  logger.info(" [guzzler] Current queue state is " + queue.getState)
-            //}
-            case streamSeek(file:String, position:String) => {
-              logger.info(" [guzzler] Received request to seek binlog " + file + " and " + position + " and stream.")
-              Guzzler.getStreamer ! StreamSeek(file, position.toLong)
-            }
-            case "guzzler stream start" => {
-              logger.info(" [guzzler] Received request to start binlog streaming.")
-              Guzzler.getStreamer ! StreamStart()
-            }
-            case "guzzler stream stop" => {
-              logger.info(" [guzzler] Received request to stop binlog streaming.")
-              Guzzler.getStreamer ! StreamStop()
-            }
-            case "guzzler stream restart" => {
-              logger.info(" [guzzler] Received request to restart binlog streaming.")
-              Guzzler.getStreamer ! StreamRestart()
-            }
-
-            case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
-          }
+  def receive = {
+    case SshdMessage(msg) => {
+      msg.stripLineEnd match {
+        case "guzzler queue pause" => {
+          logger.info(" [guzzler] Pausing main queue.")
+          Guzzler.getStreamer ! QueuePause()
         }
+        case "guzzler queue resume" => {
+          logger.info(" [guzzler] Resuming main queue.")
+          Guzzler.getStreamer ! QueueResume()
+        }
+        //case "guzzler state" => {
+        //  logger.info(" [guzzler] Current queue state is " + queue.getState)
+        //}
+        case streamSeek(file:String, position:String) => {
+          logger.info(" [guzzler] Received request to seek binlog " + file + " and " + position + " and stream.")
+          Guzzler.getStreamer ! StreamSeek(file, position.toLong)
+        }
+        case "guzzler stream start" => {
+          logger.info(" [guzzler] Received request to start binlog streaming.")
+          Guzzler.getStreamer ! StreamStart()
+        }
+        case "guzzler stream stop" => {
+          logger.info(" [guzzler] Received request to stop binlog streaming.")
+          Guzzler.getStreamer ! StreamStop()
+        }
+        case "guzzler stream restart" => {
+          logger.info(" [guzzler] Received request to restart binlog streaming.")
+          Guzzler.getStreamer ! StreamRestart()
+        }
+
         case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
       }
     }
+    case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
   }
 }
 
@@ -206,24 +203,22 @@ class GuzzlerBinlogStreamer extends Actor {
    * Creates the queue responsible for sending
    * messages to Guzzler's consumers.
    */
-  def createProcessingQueue() : Actor = new Actor {
-    def act() {
-      loop {
-        react {
-          case QueuePause() => {
-            exit()
-          }
-          case sql:String => {
-            try {
-              Util.processSql(sql)
-            } catch {
-              case e:Exception => logger.error(e, " [guzzler] Could not process SQL: " + sql)
-              case ignore => logger.error(" [guzzler] Could not process SQL (unknown error): " + sql + " -> " + ignore)
-            }
-          }
-          case _ =>
+  def createProcessingQueue() : ActorRef = Actor.actorOf[ProcessingQueue]
+
+  class ProcessingQueue extends Actor {
+    def receive = {
+      case QueuePause() => {
+        exit()
+      }
+      case sql:String => {
+        try {
+          Util.processSql(sql)
+        } catch {
+          case e:Exception => logger.error(e, " [guzzler] Could not process SQL: " + sql)
+          case ignore => logger.error(" [guzzler] Could not process SQL (unknown error): " + sql + " -> " + ignore)
         }
       }
+      case _ =>
     }
   }
 
@@ -541,17 +536,13 @@ class GuzzlerBinlogStreamer extends Actor {
     startStreaming(file, position)
   }
 
-  def act() {
-    loop {
-      react {
-        case StreamStart() => maybeStartStreaming()
-        case StreamStop() => stopStreaming()
-        case StreamSeek(file, position) => seekStream(file, position)
-        case StreamRestart() => fetchLines = false
-        case QueuePause() => queue ! QueuePause()
-        case QueueResume() => queue.restart()
-        case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
-      }
-    }
+  def receive = {
+    case StreamStart() => maybeStartStreaming()
+    case StreamStop() => stopStreaming()
+    case StreamSeek(file, position) => seekStream(file, position)
+    case StreamRestart() => fetchLines = false
+    case QueuePause() => queue ! QueuePause()
+    //case QueueResume() => queue.restart()
+    case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
   }
 }

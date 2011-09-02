@@ -19,6 +19,7 @@ package guzzler.ssh
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
+import akka.actor.ActorRef
 import actors.Actor
 import actors.Futures._
 import org.apache.sshd._
@@ -32,7 +33,7 @@ import java.lang.StringBuffer
 import scala.Int
 import java.util.concurrent.ConcurrentHashMap
 
-case class SshdSubscribe(actor:Actor, event:String)
+case class SshdSubscribe(actor:ActorRef, event:String)
 case class SshdMessage(msg:String)
 
 /**

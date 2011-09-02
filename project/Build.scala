@@ -42,6 +42,7 @@ object ShellPrompt {
 object Resolvers {
 	val GuzzlerResolvers = Seq(
 		"Local Maven Repository" at "file://" + Path.userHome + "/.m2/repository",
+		"Akka Maven Repository" at "http://akka.io/repository/",
 		JavaNet1Repository
 	)
 }
@@ -51,6 +52,7 @@ object Dependencies {
   val slf4j = "org.slf4j" % "slf4j-simple" % "1.6.1"
   val rabbitmqClient = "com.rabbitmq" % "amqp-client" % "2.5.1"
   val ssh = "org.apache.sshd" % "apache-sshd" % "0.5.0"
+  val akka = "se.scalablesolutions.akka" % "akka-actor" % "1.2-RC5"
 }
 
 object GuzzlerBuild extends Build {
@@ -59,7 +61,7 @@ object GuzzlerBuild extends Build {
   import BuildSettings._
 
 	val deps = Seq (
-		configgy, slf4j, rabbitmqClient, ssh
+		configgy, slf4j, rabbitmqClient, ssh, akka
 	)
 
   lazy val guzzler = Project (
