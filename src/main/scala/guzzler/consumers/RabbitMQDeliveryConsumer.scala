@@ -21,13 +21,15 @@ package guzzler.consumers
 
 import akka.actor.Actor
 import akka.actor.Actor._
-import org.gibello.zql._
 import guzzler.rabbitmq._
 import java.lang.Exception
 import net.lag.logging.Logger
 import net.lag.configgy.ConfigMap
 import guzzler._
 import ssh.{SshdMessage, SshdSubscribe}
+import net.sf.jsqlparser.statement.delete.Delete
+import net.sf.jsqlparser.statement.update.Update
+import net.sf.jsqlparser.statement.insert.Insert
 
 /**
  * Accepts bin log messages and pushes them into
@@ -80,16 +82,16 @@ class RabbitMQDeliveryConsumer extends Actor {
     case SshdMessage(msg) => {
       logger.info("RabbitMQDeliveryConsumer: Got an ssh message: " + msg)
     }
-    case Statement(s) => {
+    case SqlStatement(s, sql) => {
       s match {
-        case q:ZInsert => {
-          beamOff(q.toString.getBytes, q.getTable, INSERT)
+        case q:Insert => {
+          beamOff(sql.getBytes, q.getTable.getName, INSERT)
         }
-        case q:ZUpdate => {
-          beamOff(q.toString.getBytes, q.getTable, UPDATE)
+        case q:Update => {
+          beamOff(sql.getBytes, q.getTable.getName, UPDATE)
         }
-        case q:ZDelete => {
-          beamOff(q.toString.getBytes, q.getTable, DELETE)
+        case q:Delete => {
+          beamOff(sql.getBytes, q.getTable.getName, DELETE)
         }
       }
     }

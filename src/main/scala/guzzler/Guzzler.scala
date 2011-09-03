@@ -21,14 +21,15 @@ package guzzler
 
 import scala.sys.process.Process
 import scala.sys.process.ProcessIO
-import org.gibello.zql._
 import net.lag.logging.Logger
 import ssh.{SshdMessage, SshdSubscribe, Sshd}
-import java.io.{ByteArrayInputStream, InputStreamReader, BufferedReader}
 import akka.actor.Actor
 import akka.actor.Actor._
 import akka.dispatch.Future
 import akka.util.duration._
+import net.sf.jsqlparser.parser.CCJSqlParserManager
+import java.io.{StringReader, ByteArrayInputStream, InputStreamReader, BufferedReader}
+import net.sf.jsqlparser.statement.Statement
 
 /**
  * Guzzler - streams binary logs from a remote MySQL
@@ -113,16 +114,15 @@ class GuzzlerSshdSubscriber extends Actor {
 object Util {
 
   val logger = Logger.get
-  val parser = new ZqlParser()
+  val parser = new CCJSqlParserManager()
 
   def processSql(sql:String) {
     // FIXME: this is an ugly hack
     val scrubbedSql = sql.replaceAll("""\\'""", "") + ";"
-    parser.initParser(new ByteArrayInputStream(scrubbedSql.getBytes))
 
     try {
-      val statement = parser.readStatement()
-      Config.consumers.par.foreach(_ ! Statement(statement))
+      val statement = parser.parse(new StringReader(scrubbedSql))
+      Config.consumers.par.foreach(_ ! SqlStatement(statement, sql))
     } catch {
       case e:Exception => logger.error(e, " [guzzler] Exception caught while parsing SQL '" + scrubbedSql)
       case ignore => logger.error(" [guzzler] Could not process SQL (unknown error): " + scrubbedSql + " -> " + ignore)
@@ -130,8 +130,8 @@ object Util {
   }
 }
 
-// wraps ZQL's ZStatement
-case class Statement(s:ZStatement)
+// wraps a Statement
+case class SqlStatement(statement:Statement, sql:String)
 
 // pauses the queue, consumers stop getting messages
 case class QueuePause()
