@@ -28,8 +28,9 @@ import akka.actor.Actor._
 import akka.dispatch.Future
 import akka.util.duration._
 import net.sf.jsqlparser.parser.CCJSqlParserManager
-import java.io.{StringReader, ByteArrayInputStream, InputStreamReader, BufferedReader}
+import java.io.{StringReader, InputStreamReader, BufferedReader}
 import net.sf.jsqlparser.statement.Statement
+import java.util.concurrent.BlockingQueue
 
 /**
  * Guzzler - streams binary logs from a remote MySQL
@@ -51,14 +52,42 @@ object Guzzler extends App {
   // start consumers
   Config.consumers.foreach(_.start())
 
-  val sshdSubscriber = Actor.actorOf[GuzzlerSshdSubscriber]
-  sshdSubscriber.start()
+  // subscribe to the ssh server
+  val sshdSubscriber = actorOf[GuzzlerSshdSubscriber].start()
   sshd ! SshdSubscribe(sshdSubscriber, "guzzler")
 
-  val streamer = Actor.actorOf[GuzzlerBinlogStreamer]
-  streamer.start()
+  // queue that pushes out messages to consumers
+  val queue = new java.util.concurrent.ArrayBlockingQueue[String](1)
+
+  val streamer = actorOf(new GuzzlerBinlogStreamer(queue)).start()
+
+  val producer = actorOf(new GuzzlerProducer(queue)).start()
 
   def getStreamer = streamer
+}
+
+class GuzzlerProducer(q:BlockingQueue[String]) extends Actor {
+
+  val logger = Logger.get
+  var read = true
+
+  override def preStart() {
+    val f = Future {
+      while (read) {
+        val sql = q.take()
+        try {
+          Util.processSql(sql)
+        } catch {
+          case e:Exception => logger.error(e, " [guzzler] Could not process SQL: " + sql)
+          case ignore => logger.error(" [guzzler] Could not process SQL (unknown error): " + sql + " -> " + ignore)
+        }
+      }
+    }
+  }
+
+  def receive = {
+    case _ =>
+  }
 }
 
 /**
@@ -154,13 +183,10 @@ case class StreamStart()
 // stops binlog streaming
 case class StreamStop()
 
-class GuzzlerBinlogStreamer extends Actor {
+class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
 
   // logger object
   val logger = Logger.get
-
-  // queue that pushes out messages to consumers
-  var queue:ProcessingQueue = _
 
   // holds the current binlog position
   var snapshotPosition:Long = -1
@@ -197,8 +223,6 @@ class GuzzlerBinlogStreamer extends Actor {
 
   override def preStart() {
     logger.info(" [guzzler] Binlog streamer initializing.")
-    queue = new ProcessingQueue()
-    queue.start()
     startStreaming(seekFile, seekPosition)
   }
   /**
@@ -256,7 +280,7 @@ class GuzzlerBinlogStreamer extends Actor {
             try {
               str match {
                 case sqlRegex(sql) => {
-                  queue ! str
+                  queue.put(str)
                 }
                 case atRegex(position) => {
                   snapshotPosition = position.toLong
@@ -523,8 +547,8 @@ class GuzzlerBinlogStreamer extends Actor {
     case StreamStop() => stopStreaming()
     case StreamSeek(file, position) => seekStream(file, position)
     case StreamRestart() => fetchLines = false
-    case QueuePause() => queue ! QueuePause()
-    case QueueResume() => queue.restart()
+    //case QueuePause() => queue ! QueuePause()
+    //case QueueResume() => queue.restart()
     case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
   }
 }
@@ -541,6 +565,7 @@ class ProcessingQueue extends scala.actors.Actor {
         }
         case sql:String => {
           try {
+            // push into blocking queue and wait
             Util.processSql(sql)
           } catch {
             case e:Exception => logger.error(e, " [guzzler] Could not process SQL: " + sql)
