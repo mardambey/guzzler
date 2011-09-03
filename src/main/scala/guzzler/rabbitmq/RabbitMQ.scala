@@ -19,15 +19,13 @@
 
 package guzzler.rabbitmq
 
-import actors.Actor
+import akka.actor.Actor
 import net.lag.logging.Logger
 import com.rabbitmq.client.Channel
 import com.rabbitmq.client.Connection
 import com.rabbitmq.client.ConnectionFactory
 import java.util.concurrent.{ConcurrentHashMap => JCMap}
 import scala.collection.JavaConversions._
-import scala.Some
-
 
 // connect to a rabbit mq host
 case class Connect(rabbitHost: String)
@@ -182,38 +180,34 @@ class RabbitMQ extends Actor {
     }
   }
 
-  def act() {
-    loop {
-      react {
-        case Connect(host:String) => connect(host)
-        case Disconnect() => disconnect()
-        //case Reconnect() => reconnect()
-        case CreateChannel(channel:String) => createChannel(channel)
-        case DeclareQueue(channel:String, queue:String) => declareQueue(channel, queue)
-        case DeclareExchange(channel:String, exchange:String, exchangeType:String) => declareExchange(channel, exchange, exchangeType)
-        case CreateChannelWithQueue(channel:String, queue:String) => createChannelWithQueue(channel, queue)
-        case CreateChannelWithExchange(channel:String, exchange:String, exchangeType:String) => createChannelWithExchange(channel, exchange, exchangeType)
-        case SendQueue(obj, channel, queue) => {
-          channels(channel) match {
-            case None =>
-            case Some(chan) => {
-              try { chan.basicPublish("", queue, null, obj) }
-              catch { case e: Exception => logger.error(e, "Exception caught while publishing to channel " + channel + " on queue " + queue) }
-            }
-          }
+  def receive = {
+    case Connect(host:String) => connect(host)
+    case Disconnect() => disconnect()
+    //case Reconnect() => reconnect()
+    case CreateChannel(channel:String) => createChannel(channel)
+    case DeclareQueue(channel:String, queue:String) => declareQueue(channel, queue)
+    case DeclareExchange(channel:String, exchange:String, exchangeType:String) => declareExchange(channel, exchange, exchangeType)
+    case CreateChannelWithQueue(channel:String, queue:String) => createChannelWithQueue(channel, queue)
+    case CreateChannelWithExchange(channel:String, exchange:String, exchangeType:String) => createChannelWithExchange(channel, exchange, exchangeType)
+    case SendQueue(obj, channel, queue) => {
+      channels(channel) match {
+        case None =>
+        case Some(chan) => {
+          try { chan.basicPublish("", queue, null, obj) }
+          catch { case e: Exception => logger.error(e, "Exception caught while publishing to channel " + channel + " on queue " + queue) }
         }
-        case SendExchange(obj, channel, exchange, routingKey) => {
-          channels(channel) match {
-            case None =>
-            case Some(chan) => {
-              try { chan.basicPublish(exchange, routingKey, null, obj) }
-              catch { case e: Exception => logger.error(e, "Exception caught while publishing to channel " + channel + " on exchange " + exchange + " with key " + routingKey) }
-            }
-          }
-        }
-
-        case ignore =>
       }
     }
+    case SendExchange(obj, channel, exchange, routingKey) => {
+      channels(channel) match {
+        case None =>
+        case Some(chan) => {
+          try { chan.basicPublish(exchange, routingKey, null, obj) }
+          catch { case e: Exception => logger.error(e, "Exception caught while publishing to channel " + channel + " on exchange " + exchange + " with key " + routingKey) }
+        }
+      }
+    }
+
+    case ignore =>
   }
 }

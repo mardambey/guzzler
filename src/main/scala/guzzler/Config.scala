@@ -19,8 +19,9 @@
 
 package guzzler
 
+import akka.actor.{ActorRef, Actor}
+import akka.actor.Actor._
 import net.lag.logging.Logger
-import actors.Actor
 import net.lag.configgy.Configgy
 
 object Config {
@@ -28,7 +29,7 @@ object Config {
   var config:net.lag.configgy.Config = _
   val log = Logger.get
   var defaultContentType:String = ""
-  val consumers = scala.collection.mutable.Set[Actor]()
+  val consumers = scala.collection.mutable.Set[ActorRef]()
 
   var maxReconnectAttempts:Option[Int] = None
 
@@ -76,8 +77,9 @@ object Config {
     consumerCfg.foreach (c => {
       log.ifDebug("Loading consumer: " + defaultConsumerPackage + "." + c)
       try {
-      val actor = Class.forName(defaultConsumerPackage + "." + c).newInstance().asInstanceOf[Actor]
-      consumers += actor
+        val cls = Class.forName(defaultConsumerPackage + "." + c)
+        val actor = actorOf(cls.newInstance().asInstanceOf[Actor])
+        consumers += actor
       } catch {
         case e:Exception => log.ifError(e, "Error loading consumer " + c)
       }

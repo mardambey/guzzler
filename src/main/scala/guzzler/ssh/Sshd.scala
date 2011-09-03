@@ -19,9 +19,10 @@ package guzzler.ssh
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-import akka.actor.ActorRef
-import actors.Actor
-import actors.Futures._
+import akka.actor.{ActorRef, Actor}
+import akka.actor.Actor._
+import akka.dispatch.Future
+import akka.util.duration._
 import org.apache.sshd._
 import common.{NamedFactory, Factory}
 import server.auth.UserAuthNone
@@ -32,6 +33,7 @@ import server.{UserAuth, Environment, ExitCallback, Command}
 import java.lang.StringBuffer
 import scala.Int
 import java.util.concurrent.ConcurrentHashMap
+import net.lag.logging.Logger
 
 case class SshdSubscribe(actor:ActorRef, event:String)
 case class SshdMessage(msg:String)
@@ -45,116 +47,53 @@ case class SshdMessage(msg:String)
  */
 class Sshd(port:Int, hostKeyPath:String) extends Actor {
 
-  val subscribers = new ConcurrentHashMap[String, Actor]()
+  val subscribers = new ConcurrentHashMap[String, ActorRef]()
 
-  def act() {
+  override def preStart() {
 
-    future {
+    Future {
       // set up and launch the ssh server
       val sshd = SshServer.setUpDefaultServer()
       sshd.setPort(port);
       sshd.setKeyPairProvider(new SimpleGeneratorHostKeyProvider(hostKeyPath))
-      sshd.setShellFactory((new ShellFactory(this)).asInstanceOf[Factory[Command]])
+      sshd.setShellFactory((new ShellFactory(self)).asInstanceOf[Factory[Command]])
       sshd.setUserAuthFactories(List(new UserAuthNone.Factory().asInstanceOf[NamedFactory[UserAuth]]))
       sshd.start()
     }
+  }
 
-    loop {
-      react {
-        case SshdSubscribe(actor, event) => {
-          subscribers(event) = actor
-        }
-        case m @ SshdMessage(msg) => {
-          subscribers.par.foreach(s => if (msg.startsWith(s._1)) s._2 ! m)
-        }
-      }
+  def receive = {
+    case SshdSubscribe(actor, event) => {
+      subscribers(event) = actor
+    }
+    case m @ SshdMessage(msg) => {
+      subscribers.par.foreach(s => if (msg.startsWith(s._1)) s._2 ! m)
     }
   }
 }
 
-class ShellFactory(sshd:Sshd) extends Factory[Shell] {
+class ShellFactory(sshd:ActorRef) extends Factory[Shell] {
   override def create() : Shell = {
     new Shell(sshd)
   }
 }
 
-class Shell(sshd:Sshd) extends Command {
-
-  var alive = true
-  lazy val actor = new Actor() {
-
-    val reader = new BufferedReader(new InputStreamReader(in.get))
-
-    def readLine() : Option[String] = {
-
-      try {
-        Some(reader.readLine())
-      } catch {
-        case _ => None
-      }
-    }
-
-    def act() {
-
-      var reading = true
-      val reader = future {
-        while(reading) {
-          val strBuf = new StringBuffer()
-          Stream.continually(in.get.read).takeWhile(_ != -1).foreach(i => {
-            i match {
-              case 13 => { // enter
-                out.get.write(("\r\n").getBytes)
-                out.get.flush()
-                sshd ! SshdMessage(strBuf.toString)
-                strBuf.delete(0, strBuf.length())
-                strBuf
-              }
-              case 4 => {
-                strBuf.delete(0, strBuf.length())
-                out.get.write(("\r\n\r\n*guzzle* *guzzle*!\r\n\r\n").getBytes)
-                out.get.flush()
-                out.get.close()
-                exitCallback.get.onExit(0)
-                exit()
-                strBuf
-              }
-              case c => {
-                strBuf.append(c.asInstanceOf[Char])
-                out.get.write(c.asInstanceOf[Char])
-                out.get.flush()
-                strBuf
-              }
-            }
-          })
-        }
-      }
-
-      loop {
-        react {
-          case "Exit" => {
-            reading = false
-            out.get.close()
-            reader()
-            exit()
-          }
-        }
-      }
-    }
-  }
+class Shell(sshd:ActorRef) extends Command {
 
   var in:Option[InputStream] = None
   var out:Option[OutputStream] = None
   var err:Option[OutputStream] = None
   var exitCallback:Option[ExitCallback] = None
+  var alive = true
+  var actor:ActorRef = _
 
   def destroy() {
-    actor ! "Exit"
   }
 
   def start(env: Environment) {
     out.get.write("\r\n -=[ Welcome to Guzzler ]=-\r\n\r\n".getBytes)
     out.get.flush()
-    actor.start()
+    actor = actorOf(new ShellActor(sshd, this, in.get, out.get)).start()
   }
 
   def setExitCallback(callback: ExitCallback) { this.exitCallback = Some(callback) }
@@ -166,14 +105,60 @@ class Shell(sshd:Sshd) extends Command {
   def setInputStream(in: InputStream) { this.in = Some(in) }
 }
 
+class ShellActor(sshd:ActorRef, shell:Shell, in:InputStream, out:OutputStream) extends Actor {
 
+  val logger = Logger.get
+  var reader:Future[Unit] = _
+  var reading = true
+  val lineReader = new BufferedReader(new InputStreamReader(in))
 
+  def readLine() : Option[String] = {
+    try {
+      Some(lineReader.readLine())
+    } catch {
+      case _ => None
+    }
+  }
 
+  override def preStart() {
+    reader = Future {
+      while(reading) {
+        val strBuf = new StringBuffer()
+        Stream.continually(in.read).takeWhile(_ != -1).foreach(i => {
+          i match {
+            case 13 => { // enter
+              out.write(("\r\n").getBytes)
+              out.flush()
+              sshd ! SshdMessage(strBuf.toString)
+              strBuf.delete(0, strBuf.length())
+              strBuf
+            }
+            case 4 => {
+              strBuf.delete(0, strBuf.length())
+              out.write(("\r\n\r\n*guzzle* *guzzle*!\r\n\r\n").getBytes)
+              out.flush()
+              out.close()
+              reading = false
+              shell.exitCallback.get.onExit(0)
+              self ! "Exit"
+              strBuf
+            }
+            case c => {
+              strBuf.append(c.asInstanceOf[Char])
+              out.write(c.asInstanceOf[Char])
+              out.flush()
+              strBuf
+            }
+          }
+        })
+      }
+    }
+  }
 
-
-
-
-
-
-
-
+  def receive = {
+    case "Exit" => {
+      try { reader.await(2.second) } catch { case e:Exception => logger.error(e, " [guzzler] Timed out while waiting for ssh connection to close.")}
+      self.exit()
+    }
+  }
+}

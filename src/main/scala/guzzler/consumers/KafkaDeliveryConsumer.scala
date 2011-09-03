@@ -12,6 +12,8 @@ import java.util.{HashMap, Properties}
 import scala.collection.JavaConversions._
 import kafka.utils.Utils
 
+/*
+
 class KafkaDeliveryConsumer extends Actor {
 
   val INSERT = "insert"
@@ -108,3 +110,5 @@ class KafkaConsumer extends Actor {
       }
     }
 }
+
+*/

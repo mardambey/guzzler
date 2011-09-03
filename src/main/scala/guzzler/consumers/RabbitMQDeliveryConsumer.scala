@@ -19,7 +19,8 @@
 
 package guzzler.consumers
 
-import actors.Actor
+import akka.actor.Actor
+import akka.actor.Actor._
 import org.gibello.zql._
 import guzzler.rabbitmq._
 import java.lang.Exception
@@ -42,7 +43,7 @@ class RabbitMQDeliveryConsumer extends Actor {
   val logger = Logger.get
   var DATABASE:String = _
   var DATABASE_EXCHANGE:String = _
-  val rabbitMQ = new RabbitMQ
+  val rabbitMQ = actorOf[RabbitMQ]
 
   val config:ConfigMap = {
     try {
@@ -68,30 +69,27 @@ class RabbitMQDeliveryConsumer extends Actor {
 
   def getKey(table:String, op:String) : String = DATABASE + "." + table + "." + op
 
-  def beamOff(data:Array[Byte], table:String, op:String) { rabbitMQ ! SendExchange(data, DATABASE, DATABASE_EXCHANGE, getKey(table, op)) }
+  def beamOff(data:Array[Byte], table:String, op:String) {
+    rabbitMQ ! SendExchange(data, DATABASE, DATABASE_EXCHANGE, getKey(table, op))
+  }
 
-  def act() {
+  // register with the sshd server to receive commands
+  override def preStart() { Guzzler.sshd ! SshdSubscribe(self, "rabbitmq") }
 
-    // register with the sshd server to receive commands
-    Guzzler.sshd ! SshdSubscribe(this, "rabbitmq")
-
-    loop {
-      react {
-        case SshdMessage(msg) => {
-          logger.info("RabbitMQDeliveryConsumer: Got an ssh message: " + msg)
+  def receive = {
+    case SshdMessage(msg) => {
+      logger.info("RabbitMQDeliveryConsumer: Got an ssh message: " + msg)
+    }
+    case Statement(s) => {
+      s match {
+        case q:ZInsert => {
+          beamOff(q.toString.getBytes, q.getTable, INSERT)
         }
-        case Statement(s) => {
-          s match {
-            case q:ZInsert => {
-              beamOff(q.toString.getBytes, q.getTable, INSERT)
-            }
-            case q:ZUpdate => {
-              beamOff(q.toString.getBytes, q.getTable, UPDATE)
-            }
-            case q:ZDelete => {
-              beamOff(q.toString.getBytes, q.getTable, DELETE)
-            }
-          }
+        case q:ZUpdate => {
+          beamOff(q.toString.getBytes, q.getTable, UPDATE)
+        }
+        case q:ZDelete => {
+          beamOff(q.toString.getBytes, q.getTable, DELETE)
         }
       }
     }

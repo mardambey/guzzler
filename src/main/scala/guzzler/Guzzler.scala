@@ -25,9 +25,10 @@ import org.gibello.zql._
 import net.lag.logging.Logger
 import ssh.{SshdMessage, SshdSubscribe, Sshd}
 import java.io.{ByteArrayInputStream, InputStreamReader, BufferedReader}
-import akka.actor.{ActorRef, Actor}
-import akka.dispatch.{Futures, Future}
-import akka.util.Duration
+import akka.actor.Actor
+import akka.actor.Actor._
+import akka.dispatch.Future
+import akka.util.duration._
 
 /**
  * Guzzler - streams binary logs from a remote MySQL
@@ -44,8 +45,7 @@ object Guzzler extends App {
   val logger = Logger.get
 
   // start sshd
-  val sshd = new Sshd(Config.sshdPort.get, Config.sshdHostKeyPath.get)
-  sshd.start()
+  val sshd = actorOf(new Sshd(Config.sshdPort.get, Config.sshdHostKeyPath.get)).start()
 
   // start consumers
   Config.consumers.foreach(_.start())
@@ -62,7 +62,7 @@ object Guzzler extends App {
 
 /**
  * Registers a Guzzler's core commands with the
- * ssh interface for remote contrl.
+ * ssh interface for remote control.
  */
 class GuzzlerSshdSubscriber extends Actor {
 
@@ -160,8 +160,7 @@ class GuzzlerBinlogStreamer extends Actor {
   val logger = Logger.get
 
   // queue that pushes out messages to consumers
-  val queue = createProcessingQueue()
-  queue.start()
+  var queue:ProcessingQueue = _
 
   // holds the current binlog position
   var snapshotPosition:Long = -1
@@ -196,32 +195,12 @@ class GuzzlerBinlogStreamer extends Actor {
   // future holding streamer
   var streamer:Option[Future[Unit]] = None
 
-  // start streaming
-  startStreaming(seekFile, seekPosition)
-
-  /**
-   * Creates the queue responsible for sending
-   * messages to Guzzler's consumers.
-   */
-  def createProcessingQueue() : ActorRef = Actor.actorOf[ProcessingQueue]
-
-  class ProcessingQueue extends Actor {
-    def receive = {
-      case QueuePause() => {
-        exit()
-      }
-      case sql:String => {
-        try {
-          Util.processSql(sql)
-        } catch {
-          case e:Exception => logger.error(e, " [guzzler] Could not process SQL: " + sql)
-          case ignore => logger.error(" [guzzler] Could not process SQL (unknown error): " + sql + " -> " + ignore)
-        }
-      }
-      case _ =>
-    }
+  override def preStart() {
+    logger.info(" [guzzler] Binlog streamer initializing.")
+    queue = new ProcessingQueue()
+    queue.start()
+    startStreaming(seekFile, seekPosition)
   }
-
   /**
    * Streams the binlogs (as per Config) from the given file and position. If
    * skipRecord is specified, the first record will be skipped.
@@ -229,10 +208,11 @@ class GuzzlerBinlogStreamer extends Actor {
   def streamBinLog(binLogFilePosition:Array[String], skipRecord:Boolean = false) : Boolean = {
     try {
       // build and run mysql binlog streamer, possibly resuming from a certain position
-      logger.info(" [guzzler] Starting form binlong " + binLogFilePosition(0) + " at position " + binLogFilePosition(1))
+      logger.info(" [guzzler] Starting from binlog " + binLogFilePosition(0) + " at position " + binLogFilePosition(1))
 
       val binLogStreamCmd = Config.mysqlBinlogStreamer.get
       val args = List(
+        binLogStreamCmd,
         "-h" + Config.mysqlHost.get,
         "-P" + Config.mysqlPort.get,
         "-u" + Config.mysqlUser.get,
@@ -252,15 +232,7 @@ class GuzzlerBinlogStreamer extends Actor {
       val atRegex = """(?i)# at (\d+)""".r
 
       val processBuilder = new java.lang.ProcessBuilder(
-        List(binLogStreamCmd,
-          "-h" + Config.mysqlHost.get,
-          "-P" + Config.mysqlPort.get,
-          "-u" + Config.mysqlUser.get,
-          "-p" + Config.mysqlPassword.get,
-          "-R", "--start-position=" + binLogFilePosition(1),
-          "--stop-never",
-          "--stop-never-slave-server-id=" + Config.mysqlSlaveServerId.get ,
-          "-f", binLogFilePosition(0)).foldLeft(new java.util.LinkedList[String]())((list, w) => { list.add(w); list }))
+        args.foldLeft(new java.util.LinkedList[String]())((list, w) => { list.add(w); list }))
 
       val process = processBuilder.start()
       val stdout = process.getInputStream
@@ -340,7 +312,7 @@ class GuzzlerBinlogStreamer extends Actor {
           stderr => scala.io.Source.fromInputStream(stderr).getLines().foreach(binLogStdout.append))
 
         val binLogProc = binLogProcBuilder.get.run(binLogIO)
-        val binLogexitCode = binLogProc.exitValue()
+        binLogProc.exitValue()
         val binLogFilePosition = binLogStdout.toString.split("Binlog_Ignore_DB")(1).split("""\s+""").slice(0, 2)
         Some(binLogFilePosition)
       }
@@ -358,15 +330,19 @@ class GuzzlerBinlogStreamer extends Actor {
    */
   def readLine(bufferedReader:BufferedReader) : Option[String] = {
     val f = Future {
-      Some(bufferedReader.readLine())
+      bufferedReader.readLine() match {
+        case null => Some("")
+        case str => Some(str)
+      }
     }
 
-    val results = Futures.awaitAll(2000, f).map(_ match {
-      case s @ Some(str) => str
-      case error => None
-    }).asInstanceOf[List[Option[String]]]
-
-    results.head
+    try {
+      f.await(2.seconds)
+      f.get
+    } catch {
+      case e:Exception => logger.error(e, " [guzzler] Timeout while reading line from binlog.")
+      None
+    }
   }
 
   def stream(binLogFile:String, binLogPosition:Long) {
@@ -396,7 +372,7 @@ class GuzzlerBinlogStreamer extends Actor {
         case true if stream => {
 
           var keepTrying = true
-          var results:Option[List[Array[String]]] = None
+          var results:Option[Array[String]] = None
 
           for (i <- 1 to Config.maxReconnectAttempts.get if keepTrying) {
             logger.info(" [guzzler] Determining location to stream from (attempt " + i + " or " + Config.maxReconnectAttempts.get + ")")
@@ -404,14 +380,20 @@ class GuzzlerBinlogStreamer extends Actor {
             // if we're asked to start from a specific location, ie seeking,
             // then use that provided position
             if (seekFile.equals(SEEK_FILE_EMPTY) && seekPosition > SEEK_POSITION_EMPTY) {
-               results = Some(List(Array[String](seekFile, seekPosition.toString)))
+               results = Some(Array[String](seekFile, seekPosition.toString))
             } else {
-              val f = Future { getBinLogCurrentPosition.get }
-              // TODO: make timeout configurable
-              results = Some(Futures.awaitAll(2000, f).map(_ match {
-                  case s @ Some(arr:Array[String]) => { keepTrying = false; arr }
-                  case error => None
-              }).asInstanceOf[List[Array[String]]])
+              val f = Future[Array[String]] { getBinLogCurrentPosition.get }
+              results = try {
+                // TODO: make timeout configurable
+                f.await(2.seconds)
+                keepTrying = false
+                Some(f.get)
+              } catch {
+                case e:Exception => {
+                  logger.error(e, " [guzzler] Could not determine binlog position.")
+                  None
+                }
+              }
             }
           }
 
@@ -421,7 +403,7 @@ class GuzzlerBinlogStreamer extends Actor {
           }
 
           // get current position of binlog
-          val curBinLogPosition = results.get(0)
+          val curBinLogPosition = results.get
 
           // use the current filename
           binLogFilePosition(0) = curBinLogPosition(0)
@@ -488,7 +470,7 @@ class GuzzlerBinlogStreamer extends Actor {
       // wait for the streamer to exit or kill it
       // if it times out
       // TODO: make this configurable
-      try { streamer.get.await(Duration("2 seconds")) } catch { case e:Exception => logger.error(e, " [guzzler] Streamer did not stop, timed out after 2 seconds.")}
+      try { streamer.get.await(2.seconds) } catch { case e:Exception => logger.error(e, " [guzzler] Streamer did not stop, timed out after 2 seconds.")}
 
       streamer = None
     }
@@ -542,7 +524,33 @@ class GuzzlerBinlogStreamer extends Actor {
     case StreamSeek(file, position) => seekStream(file, position)
     case StreamRestart() => fetchLines = false
     case QueuePause() => queue ! QueuePause()
-    //case QueueResume() => queue.restart()
+    case QueueResume() => queue.restart()
     case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
+  }
+}
+
+class ProcessingQueue extends scala.actors.Actor {
+
+  val logger = Logger.get
+
+  def act() {
+    loop {
+      react {
+        case QueuePause() => {
+          exit()
+        }
+        case sql:String => {
+          try {
+            Util.processSql(sql)
+          } catch {
+            case e:Exception => logger.error(e, " [guzzler] Could not process SQL: " + sql)
+            case ignore => logger.error(" [guzzler] Could not process SQL (unknown error): " + sql + " -> " + ignore)
+          }
+        }
+        case _ =>
+
+      }
+    }
+
   }
 }
