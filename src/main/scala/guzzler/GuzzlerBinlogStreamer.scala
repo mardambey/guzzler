@@ -235,6 +235,8 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
     stream = true
 
     // stream binlogs until interrupted
+    // TODO: can this be turned into just an actor
+    // sending and receiving messages with a future
     while (stream) {
       // if we're here then we either need to
       // restart or we need to exit

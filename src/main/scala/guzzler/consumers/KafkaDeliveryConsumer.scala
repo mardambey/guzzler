@@ -1,17 +1,5 @@
 package guzzler.consumers
 
-import actors.Actor
-import actors.Futures._
-import guzzler.ssh.{SshdMessage, SshdSubscribe}
-import guzzler.{Statement, Guzzler}
-import org.gibello.zql.{ZDelete, ZUpdate, ZInsert}
-import kafka.producer.{ProducerData, Producer, ProducerConfig}
-import net.lag.logging.Logger
-import kafka.consumer.{Consumer, ConsumerConfig}
-import java.util.{HashMap, Properties}
-import scala.collection.JavaConversions._
-import kafka.utils.Utils
-
 /*
 
 class KafkaDeliveryConsumer extends Actor {
