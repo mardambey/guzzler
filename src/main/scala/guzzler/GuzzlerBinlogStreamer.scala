@@ -6,8 +6,11 @@ import net.lag.logging.Logger
 import akka.actor.Actor
 import akka.dispatch.Future
 import akka.util.duration._
-import java.io.{InputStreamReader, BufferedReader}
+import akka.agent.Agent
 import java.util.concurrent.BlockingQueue
+import java.util.LinkedList
+import java.io.{InputStream, InputStreamReader, BufferedReader}
+import java.lang.{Boolean, ProcessBuilder, Process => JProcess}
 
 // shows the state of the queue
  case class QueueState()
@@ -24,6 +27,19 @@ case class StreamStart()
 // stops binlog streaming
 case class StreamStop()
 
+// stream another line
+case class StreamNext()
+
+// resumes streaming from the last known position
+case class StreamResume()
+
+// resets everything to starting defaults
+case class StreamReset()
+
+//
+// TODO: redefine all "atomic" operations
+// start, stop. seek, etc
+
 /**
  * Runs mysqlbinlog and reads the input line by line. If position
  * markers are encountered they are used for check-pointing. Lines
@@ -34,17 +50,9 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
   // logger object
   val logger = Logger.get
 
-  // holds the current binlog position
-  var snapshotPosition:Long = -1
-
-  // if true, Guzzler will keep trying to stream
-  // binlogs unless it fails a max amount of times
-  // (in Config) in a row.
-  var stream = true
-
   // if true, indicates that Guzzler should iterate
   // over the binlog stream and read lines
-  var fetchLines = true
+  var fetchLines = Agent(false)
 
   // if set to true then Guzzler will force
   // the streaming to start (or stop) and kill the old
@@ -64,91 +72,212 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
   // from this position
   var seekPosition = SEEK_POSITION_EMPTY
 
-  // future holding streamer
-  var streamer:Option[Future[Unit]] = None
+  val sqlRegex = """(?i)(insert |update |delete ).*""".r
+
+  val atRegex = """(?i)# at (\d+)""".r
+
+  var process:JProcess = _
+
+  var stdout:InputStream = _
+
+  var bufferedReader:Option[BufferedReader] = None
 
   override def preStart() {
+
+    val (file, position) = getBinlogFileAndPosition
+
     logger.info(" [guzzler] Binlog streamer initializing.")
-    startStreaming(seekFile, seekPosition)
+    self ! StreamSeek(file, position.toLong)
+    self ! StreamStart()
   }
+
   /**
-   * Streams the binlogs (as per Config) from the given file and position. If
-   * skipRecord is specified, the first record will be skipped.
+   * If seekFile and seekPosition are set, use them,
+   * otherwise, find their current values from the db
+   * specified in the Config.
    */
-  def streamBinLog(binLogFilePosition:Array[String], skipRecord:Boolean = false) : Boolean = {
+  def getBinlogFileAndPosition : (String, String) = {
+    if (!seekFile.equals(SEEK_FILE_EMPTY) && seekPosition > SEEK_POSITION_EMPTY) {
+      (seekFile, seekPosition.toString)
+    } else {
+      getBinLogCurrentPosition.get
+    }
+  }
+
+  /**
+   * Run mysqlbinlog starting from the given
+   * file name and file position, skipping as
+   * many records as offset specified, defaults
+   * to zero.
+   * TODO: handle case where we can't seek
+   */
+  def binlogSeek(file:String, position:Long, offset:Int = 0) {
+
+    // build and run mysql binlog streamer, possibly resuming from a certain position
+    logger.info(" [guzzler] Seeking to binlog " + file + " at position " + position + ", skipping " + offset + " records.")
+
+    val binLogStreamCmd = Config.mysqlBinlogStreamer.get
+    val args = List(
+      binLogStreamCmd,
+      "-h" + Config.mysqlHost.get,
+      "-P" + Config.mysqlPort.get,
+      "-u" + Config.mysqlUser.get,
+      "-p" + Config.mysqlPassword.get,
+      "-R", "--start-position=" + position,
+      "--stop-never",
+      "--stop-never-slave-server-id=" + Config.mysqlSlaveServerId.get ,
+      "-f", file,
+      "--offset=" + offset)
+
     try {
-      // build and run mysql binlog streamer, possibly resuming from a certain position
-      logger.info(" [guzzler] Starting from binlog " + binLogFilePosition(0) + " at position " + binLogFilePosition(1))
 
-      val binLogStreamCmd = Config.mysqlBinlogStreamer.get
-      val args = List(
-        binLogStreamCmd,
-        "-h" + Config.mysqlHost.get,
-        "-P" + Config.mysqlPort.get,
-        "-u" + Config.mysqlUser.get,
-        "-p" + Config.mysqlPassword.get,
-        "-R", "--start-position=" + binLogFilePosition(1),
-        "--stop-never",
-        "--stop-never-slave-server-id=" + Config.mysqlSlaveServerId.get ,
-        "-f", binLogFilePosition(0)) ++ (skipRecord match {
-        case true => List("--offset=1")
-        case _ => List[String]()})
+      seekFile = file
+      seekPosition = position
 
-      if (skipRecord) logger.info(" [guzzler] Skipping the first record in the binlog.")
-
-      //val binLogStreamProcBuilder = Process(binLogStreamCmd, args)
-
-      val sqlRegex = """(?i)(insert |update |delete ).*""".r
-      val atRegex = """(?i)# at (\d+)""".r
-
-      val processBuilder = new java.lang.ProcessBuilder(
-        args.foldLeft(new java.util.LinkedList[String]())((list, w) => { list.add(w); list }))
-
-      val process = processBuilder.start()
-      val stdout = process.getInputStream
-
-      val bufferedReader = new BufferedReader(new InputStreamReader(stdout))
-      var line = readLine(bufferedReader)
-
-      logger.info(" [guzzler] Guzzling down binary logs *guzzle* *guzzle*")
-
-      fetchLines = true
-
-      while (fetchLines) {
-        line match {
-          case None => {
-            // timeout
-            fetchLines = false
-            process.destroy()
-            throw new Exception(" [guzzler] Caught timeout while reading from mysqlbinlog at position " + snapshotPosition)
-          }
-          case Some(str) => {
-            try {
-              str match {
-                case sqlRegex(sql) => {
-                  queue.put(str)
-                }
-                case atRegex(position) => {
-                  snapshotPosition = position.toLong
-                }
-                case ignore =>
-              }
-            } catch {
-              case _ =>
-            }
-            line = readLine(bufferedReader)
-          }
-        }
-      }
-
-      logger.info(" [guzzler] Stopped fetching lines from binlog stream.")
-      true
+      // use the args above to build a process
+      val processBuilder = new ProcessBuilder(
+        args.foldLeft(new LinkedList[String]())((list, w) => { list.add(w); list }))
+      process = processBuilder.start()
+      stdout = process.getInputStream
+      bufferedReader = Some(new BufferedReader(new InputStreamReader(stdout)))
     } catch {
       case e:Exception => {
-        logger.error(e, " [guzzler] Could not stream binary logs.")
-        true
+        logger.error(e, " [guzzler] Could not seek to binlog " + file + " at position " + position)
+        bufferedReader = None
       }
     }
+  }
+
+  /**
+   * Reads lines from the binary log. We should
+   * already have called seek to the proper location.
+   */
+  def binlogReadLines() {
+    bufferedReader match {
+      case Some(br) => {
+        val line = binlogReadLine(bufferedReader.get)
+        val notTimeoutedOut = binlogConsumeLine(line)
+
+        // if we havent timed out try to
+        // read the next line
+        if (notTimeoutedOut) {
+          if (fetchLines())
+            self ! StreamNext()
+          else {
+            // someone stopped us while reading
+            logger.info(" [guzzler] Stopping binlog streaming process at " + seekFile + " position " + seekPosition)
+            bufferedReader.get.close()
+            bufferedReader = None
+            process.destroy()
+          }
+        } else {
+          // being here means we've timed out while
+          //trying to read from mysqlbinlog
+
+          fetchLines.send(false)
+          process.destroy()
+          logger.info(" [guzzler] Caught timeout while reading from mysqlbinlog at position " + seekPosition)
+
+          // we're at snapshotPosition, try to resume from there, if we cant,
+          // get the current file + pos and resume from there
+          Thread.sleep(2000) // grace period
+          self ! StreamSeek(seekFile, seekPosition)
+          self ! StreamStart()
+        }
+      }
+      case None => {
+        logger.error(" [guzzler] Could not read lines from binlog " + seekFile + " at position " + seekPosition)
+      }
+    }
+  }
+
+  def binlogConsumeLine(line:Option[String]) : Boolean = {
+    line match {
+      case None => {
+        // timeout
+        false
+      }
+      case Some(str) => {
+        try {
+          str match {
+            case sqlRegex(sql) => {
+              queue.put(str)
+            }
+            case atRegex(position) => {
+              seekPosition = position.toLong
+            }
+            case ignore =>
+          }
+        } catch {
+          case _ =>
+        }
+        true
+      }
+      case _ => true
+    }
+  }
+
+  /**
+   * Attempts to read a line from the binlog stream.
+   * Times out the read based on the Config, this
+   * causes a reconnect attempt.
+   *
+   * Returns empty string if the buffered reader get a
+   * null, returns the line if it could be read, and
+   * None if the read times out.
+   *
+   * TODO: make this retry first before reconnecting
+   */
+  def binlogReadLine(bufferedReader:BufferedReader) : Option[String] = {
+    val f = Future {
+      bufferedReader.readLine() match {
+        case null => Some("")
+        case str => Some(str)
+      }
+    }
+
+    try {
+      f.await(2.seconds)
+      f.get
+    } catch {
+      case e:Exception => logger.error(e, " [guzzler] Timeout while reading line from binlog.")
+      None
+    }
+  }
+
+  /**
+   * Stop reading from mysqlbinlog and
+   * terminates the process.
+   */
+  def binlogStop() {
+
+    logger.info(" [guzzler] About to stop streaming binlogs.")
+
+    // stop fetching lines
+    fetchLines.send(false)
+  }
+
+  def binlogReset() {
+
+    logger.info(" [guzzler] Resetting stream state.")
+
+    fetchLines.send(false)
+
+    bufferedReader match {
+      case Some(bf) => bf.close()
+      case _ =>
+    }
+
+    process match {
+      case null =>
+      case p => process.destroy()
+    }
+
+    bufferedReader = None
+    process = null
+
+    seekFile = SEEK_FILE_EMPTY
+    seekPosition = SEEK_POSITION_EMPTY
   }
 
   def die(msg:String, e:Option[Exception] = None) {
@@ -160,7 +289,11 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
     sys.exit(-1)
   }
 
-  def getBinLogCurrentPosition : Option[Array[String]] = {
+  /**
+   * Queries the MySQL server for the current file and
+   * position of its binlog.
+   */
+  def getBinLogCurrentPosition : Option[(String, String)] = {
     val binLogPositionCmd = Config.mysqlCmd.get
     val binLogStdout = new StringBuffer()
     val binLogProcBuilder = {
@@ -184,7 +317,7 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
         val binLogProc = binLogProcBuilder.get.run(binLogIO)
         binLogProc.exitValue()
         val binLogFilePosition = binLogStdout.toString.split("Binlog_Ignore_DB")(1).split("""\s+""").slice(0, 2)
-        Some(binLogFilePosition)
+        Some((binLogFilePosition(0), binLogFilePosition(1)))
       }
       case error => {
         None
@@ -192,211 +325,66 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
     }
   }
 
-  /**
-   * Attempts to read a line from the binlog stream.
-   * Times out the read based on the Config, this
-   * causes a reconnect attempt.
-   * TODO: make this retry first before reconnecting
-   */
-  def readLine(bufferedReader:BufferedReader) : Option[String] = {
-    val f = Future {
-      bufferedReader.readLine() match {
-        case null => Some("")
-        case str => Some(str)
-      }
-    }
-
-    try {
-      f.await(2.seconds)
-      f.get
-    } catch {
-      case e:Exception => logger.error(e, " [guzzler] Timeout while reading line from binlog.")
-      None
-    }
-  }
-
-  def stream(binLogFile:String, binLogPosition:Long) {
-
-    // if given a binlog file and position, use them,
-    // otherwise, find them from the db specified in the Config
-    val binLogFilePosition = if (!binLogFile.equals(SEEK_FILE_EMPTY) && binLogPosition > SEEK_POSITION_EMPTY) {
-      Array[String](binLogFile, binLogPosition.toString)
-    } else {
-      // find the current name and position of the binlog to stream
-      getBinLogCurrentPosition.getOrElse({die("Could not get current binlog position.")}).asInstanceOf[Array[String]]
-    }
-
-    // if set to true, the first record will be
-    // skipped using --offset=1 in mysqlbinlog
-    // this is used when theres a recovery from
-    // a crash or a restart of the streamer
-    var skipRecord = false
-
-    stream = true
-
-    // stream binlogs until interrupted
-    // TODO: can this be turned into just an actor
-    // sending and receiving messages with a future
-    while (stream) {
-      // if we're here then we either need to
-      // restart or we need to exit
-      streamBinLog(binLogFilePosition, skipRecord) match {
-        case true if stream => {
-
-          var keepTrying = true
-          var results:Option[Array[String]] = None
-
-          for (i <- 1 to Config.maxReconnectAttempts.get if keepTrying) {
-            logger.info(" [guzzler] Determining location to stream from (attempt " + i + " or " + Config.maxReconnectAttempts.get + ")")
-
-            // if we're asked to start from a specific location, ie seeking,
-            // then use that provided position
-            if (seekFile.equals(SEEK_FILE_EMPTY) && seekPosition > SEEK_POSITION_EMPTY) {
-               results = Some(Array[String](seekFile, seekPosition.toString))
-            } else {
-              val f = Future[Array[String]] { getBinLogCurrentPosition.get }
-              results = try {
-                // TODO: make timeout configurable
-                f.await(2.seconds)
-                keepTrying = false
-                Some(f.get)
-              } catch {
-                case e:Exception => {
-                  logger.error(e, " [guzzler] Could not determine binlog position.")
-                  None
-                }
-              }
+  def receive = {
+    // Start streaming. In order for this to work we
+    // must have seeked() before.
+    case StreamStart() => {
+      bufferedReader match {
+        case None => logger.error(" [guzzler] Can not start streaming binlog is not seeked (current seek valies: " + seekFile + " at " + seekPosition + ")")
+        case _ => {
+          fetchLines() match {
+            case true => logger.error(" [guzzler] Can not start streaming if another stream is already active (" + seekFile + " at " + seekPosition + ")")
+            case _ => {
+              fetchLines.send(true)
+              binlogReadLines()
             }
           }
-
-          results match {
-            case None => die("Could not determine the current binary log position, last good position is " + binLogFilePosition(0) + " -> " + binLogFilePosition(1))
-            case _ =>
-          }
-
-          // get current position of binlog
-          val curBinLogPosition = results.get
-
-          // use the current filename
-          binLogFilePosition(0) = curBinLogPosition(0)
-
-          // use the last saved position unless a seekPosition
-          // was asked for
-          binLogFilePosition(1) = if (seekPosition > SEEK_POSITION_EMPTY) seekPosition.toString else snapshotPosition.toString
-
-          // reset seek file and position
-          // in case they were spcified
-          seekFile = SEEK_FILE_EMPTY
-          seekPosition = SEEK_POSITION_EMPTY
-
-          logger.info(" [guzzler] Resuming from binlog file " + binLogFilePosition(0) +
-            " from position " + binLogFilePosition(1) +
-            " (current server position: " + curBinLogPosition(1) + ")")
-
-          // grace period
-          // TODO: make configurable
-          Thread.sleep(2000)
-        }
-        case false => {
-          stream = false
-          die(" [guzzler] Not resuming, exiting.")
-        }
-        // we're being asked to stop streaming
-        // since "stream" is false
-        case true => {
-          logger.info(" [guzzler] Leaving main streaming loop.")
         }
       }
-
-      // being here means we either
-      // crashed or were restarted,
-      // in both cases skip the first
-      // record that is received
-      skipRecord = true
     }
-  }
 
-  def startStreaming(binLogFile:String, binLogPosition:Long) {
-    streamer = Some(Future {
-      stream(binLogFile, binLogPosition)
-    })
-  }
-
-  /**
-   * Stops streaming if we're currently streaming..
-   * If we not streaming and we're not being forced to stop
-   * then ignore this request, otherwise acts as a form of a
-   * kill to the streaming request.
-   */
-  def stopStreaming() {
-    if (!stream && !forceStartStop) logger.info(" [guzzler] Asked to stop streaming while already stopped, refusing, use \"force\" to override.")
-    else {
-      logger.info(" [guzzler] About to stop streaming binlogs.")
-
-      // stop main streaming loop from reconnecting
-      stream = false
-
-      // stop fetching lines
-      fetchLines = false
-
-      // wait for the streamer to exit or kill it
-      // if it times out
-      // TODO: make this configurable
-      try { streamer.get.await(2.seconds) } catch { case e:Exception => logger.error(e, " [guzzler] Streamer did not stop, timed out after 2 seconds.")}
-
-      streamer = None
-    }
-  }
-
-  /**
-   * Starts streaming if we're not already doing so.
-   * If we are and we're not being forced to do so
-   * then ignore this request.
-   */
-  def maybeStartStreaming() {
-    if (stream && !forceStartStop) logger.info(" [guzzler] Asked to start streaming while already active, refusing, use \"force\" to override.")
-    else {
-
-      // if streaming, stop
-      maybeStopStreaming()
-
-      val curBinLoFileAndPos = getBinLogCurrentPosition.get
-      // reset force start in case it was used
-      forceStartStop = false
-
-      if (snapshotPosition > -1) {
-        // TODO: do not "get" this blindly
-        startStreaming(curBinLoFileAndPos(0), snapshotPosition)
-      } else {
-        startStreaming(curBinLoFileAndPos(0), curBinLoFileAndPos(1).toLong)
+    // Stops streaming. This finishes reading the current
+    // line and terminates the streaming process.
+    case StreamStop() => {
+      bufferedReader match {
+        case None => logger.error(" [guzzler] Can not stop streaming if no stream is active.")
+        case _ => binlogStop()
       }
     }
-  }
 
-  /**
-   * If we're streaming, stop doing so.
-   */
-  def maybeStopStreaming() {
-    if (streamer != None) stopStreaming()
-  }
+    // Seeks to the specified binlog file and postition.
+    // Does not start streaming, can not be called while
+    // a streaming process is running.
+    case StreamSeek(file, position) => {
+      bufferedReader match {
+        case None => binlogSeek(file, position)
+        case _ => logger.error(" [guzzler] Can not seek if stream is already active.")
+      }
+    }
 
-  /**
-   * Attempts to seek to the given file and
-   * position in the binlog stream.
-   */
-  def seekStream(file:String, position:Long) {
-    logger.info(" [guzzler] Received request to seek to binlog file " + file + " and position " + position)
-    maybeStopStreaming()
-    startStreaming(file, position)
-  }
+    // Reads the next line from the already
+    // open stream and seeked to stream.
+    case StreamNext() => {
+      bufferedReader match {
+        case None => logger.error(" [guzzler] Can not fetch next line if stream is not active.")
+        case _ => binlogReadLines()
+      }
+    }
 
-  def receive = {
-    case StreamStart() => maybeStartStreaming()
-    case StreamStop() => stopStreaming()
-    case StreamSeek(file, position) => seekStream(file, position)
-    case StreamRestart() => fetchLines = false
-    //case QueuePause() => queue ! QueuePause()
-    //case QueueResume() => queue.restart()
+    // Resumes the streaming from the last
+    // known good position.
+    case StreamResume() => {
+      self ! StreamSeek(seekFile, seekPosition)
+      self ! StreamStart()
+    }
+
+    // Resets the stream to its default
+    // state in case of a lock-up.
+    case StreamReset() => {
+      binlogReset()
+    }
+
+
     case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
   }
 }

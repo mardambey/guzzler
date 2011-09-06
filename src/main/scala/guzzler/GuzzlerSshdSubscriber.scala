@@ -19,17 +19,6 @@ class GuzzlerSshdSubscriber extends Actor {
   def receive = {
     case SshdMessage(msg) => {
       msg.stripLineEnd match {
-        case "guzzler queue pause" => {
-          logger.info(" [guzzler] Pausing main queue.")
-          Guzzler.getStreamer ! QueuePause()
-        }
-        case "guzzler queue resume" => {
-          logger.info(" [guzzler] Resuming main queue.")
-          Guzzler.getStreamer ! QueueResume()
-        }
-        //case "guzzler state" => {
-        //  logger.info(" [guzzler] Current queue state is " + queue.getState)
-        //}
         case streamSeek(file:String, position:String) => {
           logger.info(" [guzzler] Received request to seek binlog " + file + " and " + position + " and stream.")
           Guzzler.getStreamer ! StreamSeek(file, position.toLong)
@@ -42,11 +31,14 @@ class GuzzlerSshdSubscriber extends Actor {
           logger.info(" [guzzler] Received request to stop binlog streaming.")
           Guzzler.getStreamer ! StreamStop()
         }
-        case "guzzler stream restart" => {
-          logger.info(" [guzzler] Received request to restart binlog streaming.")
-          Guzzler.getStreamer ! StreamRestart()
+        case "guzzler stream resume" => {
+          logger.info(" [guzzler] Received request to resume binlog streaming.")
+          Guzzler.getStreamer ! StreamResume()
         }
-
+        case "guzzler stream reset" => {
+          logger.info(" [guzzler] Received request to reset binlog streaming.")
+          Guzzler.getStreamer ! StreamReset()
+        }
         case unknown => logger.error(" [guzzler] Unknown message received: " + unknown)
       }
     }
