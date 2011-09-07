@@ -10,7 +10,8 @@ import akka.agent.Agent
 import java.util.concurrent.BlockingQueue
 import java.util.LinkedList
 import java.io.{InputStream, InputStreamReader, BufferedReader}
-import java.lang.{Boolean, ProcessBuilder, Process => JProcess}
+import java.nio.CharBuffer
+import java.lang.{Exception, Boolean, ProcessBuilder, Process => JProcess}
 
 // shows the state of the queue
  case class QueueState()
@@ -140,6 +141,22 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
       process = processBuilder.start()
       stdout = process.getInputStream
       bufferedReader = Some(new BufferedReader(new InputStreamReader(stdout)))
+
+      // make sure there we were able to seek
+      val readAheadLimit = 2048
+      val buf = new Array[Char](readAheadLimit)
+
+      bufferedReader.get.mark(readAheadLimit + 1)
+      bufferedReader.get.read(buf)
+
+      if (new String(buf).contains("ERROR:")) {
+        bufferedReader.get.close()
+        bufferedReader = None
+        process.destroy()
+        throw new Exception("Error encountered while attempting to seek from  " + file + " at " + position + ": " + new String(buf))
+      }
+
+      bufferedReader.get.reset()
     } catch {
       case e:Exception => {
         logger.error(e, " [guzzler] Could not seek to binlog " + file + " at position " + position)
@@ -155,13 +172,13 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
   def binlogReadLines() {
     bufferedReader match {
       case Some(br) => {
-        val line = binlogReadLine(bufferedReader.get)
+        val line = binlogReadLine(br)
         val notTimeoutedOut = binlogConsumeLine(line)
 
         // if we havent timed out try to
         // read the next line
         if (notTimeoutedOut) {
-          if (fetchLines())
+          if (fetchLines.await())
             self ! StreamNext()
           else {
             // someone stopped us while reading
@@ -181,8 +198,7 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
           // we're at snapshotPosition, try to resume from there, if we cant,
           // get the current file + pos and resume from there
           Thread.sleep(2000) // grace period
-          self ! StreamSeek(seekFile, seekPosition)
-          self ! StreamStart()
+          self ! StreamResume()
         }
       }
       case None => {
@@ -330,9 +346,9 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
     // must have seeked() before.
     case StreamStart() => {
       bufferedReader match {
-        case None => logger.error(" [guzzler] Can not start streaming binlog is not seeked (current seek valies: " + seekFile + " at " + seekPosition + ")")
+        case None => logger.error(" [guzzler] Can not start streaming binlog is not seeked (current seek values: " + seekFile + " at " + seekPosition + ")")
         case _ => {
-          fetchLines() match {
+          fetchLines.await() match {
             case true => logger.error(" [guzzler] Can not start streaming if another stream is already active (" + seekFile + " at " + seekPosition + ")")
             case _ => {
               fetchLines.send(true)
@@ -357,7 +373,9 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
     // a streaming process is running.
     case StreamSeek(file, position) => {
       bufferedReader match {
-        case None => binlogSeek(file, position)
+        case None => {
+          binlogSeek(file, position)
+        }
         case _ => logger.error(" [guzzler] Can not seek if stream is already active.")
       }
     }
@@ -374,7 +392,10 @@ class GuzzlerBinlogStreamer(queue:BlockingQueue[String]) extends Actor {
     // Resumes the streaming from the last
     // known good position.
     case StreamResume() => {
-      self ! StreamSeek(seekFile, seekPosition)
+      val sf = seekFile
+      val sp = seekPosition
+      self ! StreamReset()
+      self ! StreamSeek(sf, sp)
       self ! StreamStart()
     }
 
