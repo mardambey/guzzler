@@ -1,6 +1,9 @@
 Guzzler: Stream MySQL binary logs and act on them
 =================================================
 
+Guzzler has been superceded by https://github.com/mardambey/mypipe
+---
+
 Guzzler allows you to stream MySQL binary logs from a master and lets you
 act on them using Scala actors (consumers). Consumers are configurable in
 guzzler.conf along with the rest of the required parameters. Included with
